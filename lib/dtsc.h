@@ -117,6 +117,8 @@ namespace DTSC {
       Stream(unsigned int buffers, unsigned int bufferTime = 0);
       JSON::Value metadata;
       JSON::Value & getPacket(unsigned int num = 0);
+      //Resend last metadata to new streams
+      JSON::Value lastmetapack;
       datatype lastType();
       std::string & lastData();
       bool hasVideo();

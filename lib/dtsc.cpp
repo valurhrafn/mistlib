@@ -157,6 +157,9 @@ bool DTSC::Stream::parsePacket(Socket::Buffer & buffer){
         }
         if (tmp == "meta"){
           datapointertype = META;
+          //Added by Valur Hrafn to resend last metadata to new streams
+          lastmetapack = buffers.front();
+          lastmetapack.netPrepare();
         }
         if (tmp == "pause_marker"){
           datapointertype = PAUSEMARK;
@@ -295,7 +298,9 @@ DTSC::Ring * DTSC::Stream::getRing(){
   if (keyframes.size() == 0){
     tmp = new DTSC::Ring(0);
   }else{
-    tmp = new DTSC::Ring(keyframes[0].b);
+   // Changed by Valur Hrafn was:
+   // tmp = new DTSC::Ring(keyframes[0].b);
+     tmp = new DTSC::Ring(keyframes[keyframes.size()/2].b);
   }
   rings.insert(tmp);
   return tmp;
