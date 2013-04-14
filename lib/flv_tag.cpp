@@ -115,6 +115,62 @@ bool FLV::Tag::isInitData(){
   return false;
 }
 
+const char * FLV::Tag::getVideoCodec(){
+  switch (data[11] & 0x0F){
+    case 1:
+      return "JPEG";
+    case 2:
+      return "H263";
+    case 3:
+      return "ScreenVideo1";
+    case 4:
+      return "VP6";
+    case 5:
+      return "VP6Alpha";
+    case 6:
+      return "ScreenVideo2";
+    case 7:
+      return "H264";
+    default:
+      return "unknown";
+  }
+}
+
+const char * FLV::Tag::getAudioCodec(){
+  switch (data[11] & 0xF0){
+    case 0x00:
+      return "linear PCM PE";
+    case 0x10:
+      return "ADPCM";
+    case 0x20:
+      return "MP3";
+    case 0x30:
+      return "linear PCM LE";
+    case 0x40:
+      return "Nelly16kHz";
+    case 0x50:
+      return "Nelly8kHz";
+    case 0x60:
+      return "Nelly";
+    case 0x70:
+      return "G711A-law";
+    case 0x80:
+      return "G711mu-law";
+    case 0x90:
+      return "reserved";
+    case 0xA0:
+      return "AAC";
+    case 0xB0:
+      return "Speex";
+    case 0xE0:
+      return "MP38kHz";
+    case 0xF0:
+      return "DeviceSpecific";
+    default:
+      return "unknown";
+  }
+}
+
 /// Returns a std::string describing the tag in detail.
 /// The string includes information about whether the tag is
 /// audio, video or metadata, what encoding is used, and the details
@@ -124,33 +180,7 @@ std::string FLV::Tag::tagType(){
   R << len << " bytes of ";
   switch (data[0]){
     case 0x09:
-      switch (data[11] & 0x0F){
-        case 1:
-          R << "JPEG";
-          break;
-        case 2:
-          R << "H263";
-          break;
-        case 3:
-          R << "ScreenVideo1";
-          break;
-        case 4:
-          R << "VP6";
-          break;
-        case 5:
-          R << "VP6Alpha";
-          break;
-        case 6:
-          R << "ScreenVideo2";
-          break;
-        case 7:
-          R << "H264";
-          break;
-        default:
-          R << "unknown";
-          break;
-      }
-      R << " video ";
+      R << getVideoCodec() << " video ";
       switch (data[11] & 0xF0){
         case 0x10:
           R << "keyframe";
@@ -183,53 +213,7 @@ std::string FLV::Tag::tagType(){
       }
       break;
     case 0x08:
-      switch (data[11] & 0xF0){
-        case 0x00:
-          R << "linear PCM PE";
-          break;
-        case 0x10:
-          R << "ADPCM";
-          break;
-        case 0x20:
-          R << "MP3";
-          break;
-        case 0x30:
-          R << "linear PCM LE";
-          break;
-        case 0x40:
-          R << "Nelly16kHz";
-          break;
-        case 0x50:
-          R << "Nelly8kHz";
-          break;
-        case 0x60:
-          R << "Nelly";
-          break;
-        case 0x70:
-          R << "G711A-law";
-          break;
-        case 0x80:
-          R << "G711mu-law";
-          break;
-        case 0x90:
-          R << "reserved";
-          break;
-        case 0xA0:
-          R << "AAC";
-          break;
-        case 0xB0:
-          R << "Speex";
-          break;
-        case 0xE0:
-          R << "MP38kHz";
-          break;
-        case 0xF0:
-          R << "DeviceSpecific";
-          break;
-        default:
-          R << "unknown";
-          break;
-      }
+      R << getAudioCodec();
       switch (data[11] & 0x0C){
         case 0x0:
           R << " 5.5kHz";
@@ -310,11 +294,11 @@ FLV::Tag::Tag(){
 FLV::Tag::Tag(const Tag& O){
   done = true;
   sofar = 0;
-  buf = O.len;
-  len = buf;
+  len = O.len;
   if (len > 0){
-    data = (char*)malloc(len);
-    memcpy(data, O.data, len);
+    if (checkBufferSize()){
+      memcpy(data, O.data, len);
+    }
   }else{
     data = 0;
   }
@@ -351,16 +335,11 @@ FLV::Tag & FLV::Tag::operator=(const FLV::Tag& O){
   if (this != &O){ //no self-assignment
     len = O.len;
     if (len > 0){
-      if ( !data){
-        data = (char*)malloc(len);
-        buf = len;
+      if (checkBufferSize()){
+        memcpy(data, O.data, len);
       }else{
-        if (buf < len){
-          data = (char*)realloc(data, len);
-          buf = len;
-        }
+        len = buf;
       }
-      memcpy(data, O.data, len);
     }
     isKeyframe = O.isKeyframe;
   }
@@ -407,14 +386,8 @@ bool FLV::Tag::DTSCLoader(DTSC::Stream & S){
       break;
   }
   if (len > 0){
-    if ( !data){
-      data = (char*)malloc(len);
-      buf = len;
-    }else{
-      if (buf < len){
-        data = (char*)realloc(data, len);
-        buf = len;
-      }
+    if ( !checkBufferSize()){
+      return false;
     }
     switch (S.lastType()){
       case DTSC::VIDEO:
@@ -535,14 +508,8 @@ bool FLV::Tag::DTSCVideoInit(DTSC::Stream & S){
     len = S.metadata["video"]["init"].asString().length() + 20;
   }
   if (len > 0){
-    if ( !data){
-      data = (char*)malloc(len);
-      buf = len;
-    }else{
-      if (buf < len){
-        data = (char*)realloc(data, len);
-        buf = len;
-      }
+    if ( !checkBufferSize()){
+      return false;
     }
     memcpy(data + 16, S.metadata["video"]["init"].asString().c_str(), len - 20);
     data[12] = 0; //H264 sequence header
@@ -576,14 +543,8 @@ bool FLV::Tag::DTSCAudioInit(DTSC::Stream & S){
     len = S.metadata["audio"]["init"].asString().length() + 17;
   }
   if (len > 0){
-    if ( !data){
-      data = (char*)malloc(len);
-      buf = len;
-    }else{
-      if (buf < len){
-        data = (char*)realloc(data, len);
-        buf = len;
-      }
+    if ( !checkBufferSize()){
+      return false;
     }
     memcpy(data + 13, S.metadata["audio"]["init"].asString().c_str(), len - 17);
     data[12] = 0; //AAC sequence header
@@ -741,16 +702,11 @@ bool FLV::Tag::DTSCMetaInit(DTSC::Stream & S){
   std::string tmp = amfdata.Pack();
   len = tmp.length() + 15;
   if (len > 0){
-    if ( !data){
-      data = (char*)malloc(len);
-      buf = len;
+    if (checkBufferSize()){
+      memcpy(data + 11, tmp.c_str(), len - 15);
     }else{
-      if (buf < len){
-        data = (char*)realloc(data, len);
-        buf = len;
-      }
+      return false;
     }
-    memcpy(data + 11, tmp.c_str(), len - 15);
   }
   setLen();
   data[0] = 0x12;
@@ -769,15 +725,8 @@ bool FLV::Tag::DTSCMetaInit(DTSC::Stream & S){
 bool FLV::Tag::ChunkLoader(const RTMPStream::Chunk& O){
   len = O.len + 15;
   if (len > 0){
-    if (buf < len || !data){
-      char * newdata = (char*)realloc(data, len);
-      // on realloc fail, retain the old data
-      if (newdata != 0){
-        data = newdata;
-        buf = len;
-      }else{
-        return false;
-      }
+    if ( !checkBufferSize()){
+      return false;
     }
     memcpy(data + 11, &(O.data[0]), O.len);
   }
@@ -828,9 +777,11 @@ bool FLV::Tag::MemReadUntil(char * buffer, unsigned int count, unsigned int & so
 /// \param P The current position in the data buffer. Will be updated to reflect new position.
 /// \return True if a whole tag is succesfully read, false otherwise.
 bool FLV::Tag::MemLoader(char * D, unsigned int S, unsigned int & P){
-  if (buf < 15){
-    data = (char*)realloc(data, 15);
-    buf = 15;
+  if (len < 15){
+    len = 15;
+  }
+  if ( !checkBufferSize()){
+    return false;
   }
   if (done){
     //read a header
@@ -852,9 +803,8 @@ bool FLV::Tag::MemLoader(char * D, unsigned int S, unsigned int & P){
         len = data[3] + 15;
         len += (data[2] << 8);
         len += (data[1] << 16);
-        if (buf < len){
-          data = (char*)realloc(data, len);
-          buf = len;
+        if ( !checkBufferSize()){
+          return false;
         }
         if (data[0] > 0x12){
           data[0] += 32;
@@ -919,9 +869,10 @@ bool FLV::Tag::FileLoader(FILE * f){
   int preflags = fcntl(fileno(f), F_GETFL, 0);
   int postflags = preflags | O_NONBLOCK;
   fcntl(fileno(f), F_SETFL, postflags);
-  if (buf < 15){
-    data = (char*)realloc(data, 15);
-    buf = 15;
+  
+  if (len < 15){len = 15;}
+  if ( !checkBufferSize()){
+    return false;
   }
 
   if (done){
@@ -946,9 +897,8 @@ bool FLV::Tag::FileLoader(FILE * f){
         len = data[3] + 15;
         len += (data[2] << 8);
         len += (data[1] << 16);
-        if (buf < len){
-          data = (char*)realloc(data, len);
-          buf = len;
+        if ( !checkBufferSize()){
+          return false;
         }
         if (data[0] > 0x12){
           data[0] += 32;
@@ -1109,15 +1059,8 @@ JSON::Value FLV::Tag::toJSON(JSON::Value & metadata){
     }
     pack_out["datatype"] = "audio";
     pack_out["time"] = tagTime();
-    if ( !metadata["audio"].isMember("codec") || metadata["audio"]["size"].asString() == ""){
-      switch (audiodata & 0xF0){
-        case 0x20:
-          metadata["audio"]["codec"] = "MP3";
-          break;
-        case 0xA0:
-          metadata["audio"]["codec"] = "AAC";
-          break;
-      }
+    if ( !metadata["audio"].isMember("codec") || metadata["audio"]["codec"].asString() == "?" || metadata["audio"]["codec"].asString() == ""){
+      metadata["audio"]["codec"] = getAudioCodec();
     }
     if ( !metadata["audio"].isMember("rate") || metadata["audio"]["rate"].asInt() < 1){
       switch (audiodata & 0x0C){
@@ -1184,18 +1127,8 @@ JSON::Value FLV::Tag::toJSON(JSON::Value & metadata){
       }
       return pack_out; //skip rest of parsing, get next tag.
     }
-    if ( !metadata["video"].isMember("codec") || metadata["video"]["codec"].asString() == ""){
-      switch (videodata & 0x0F){
-        case 2:
-          metadata["video"]["codec"] = "H263";
-          break;
-        case 4:
-          metadata["video"]["codec"] = "VP6";
-          break;
-        case 7:
-          metadata["video"]["codec"] = "H264";
-          break;
-      }
+    if ( !metadata["video"].isMember("codec") || metadata["video"]["codec"].asString() == "?" || metadata["video"]["codec"].asString() == ""){
+      metadata["video"]["codec"] = getVideoCodec();
     }
     pack_out["datatype"] = "video";
     switch (videodata & 0xF0){
@@ -1242,3 +1175,21 @@ JSON::Value FLV::Tag::toJSON(JSON::Value & metadata){
   }
   return pack_out; //should never get here
 } //FLV::Tag::toJSON
+
+/// Checks if buf is large enough to contain len.
+/// Attempts to resize data buffer if not/
+/// \returns True if buffer is large enough, false otherwise.
+bool FLV::Tag::checkBufferSize(){
+  if (buf < len || !data){
+    char * newdata = (char*)realloc(data, len);
+    // on realloc fail, retain the old data
+    if (newdata != 0){
+      data = newdata;
+      buf = len;
+    }else{
+      len = buf;
+      return false;
+    }
+  }
+  return true;
+}
