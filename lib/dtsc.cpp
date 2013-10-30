@@ -7,11 +7,11 @@
 #include <arpa/inet.h> //for htonl/ntohl
 char DTSC::Magic_Header[] = "DTSC";
 char DTSC::Magic_Packet[] = "DTPD";
+char DTSC::Magic_Packet2[] = "DTP2";
 
 /// Initializes a DTSC::Stream with only one packet buffer.
 DTSC::Stream::Stream(){
   datapointertype = DTSC::INVALID;
-  datapointer = 0;
   buffercount = 1;
   buffertime = 0;
 }
@@ -20,7 +20,6 @@ DTSC::Stream::Stream(){
 /// The actual buffer count may not at all times be the requested amount.
 DTSC::Stream::Stream(unsigned int rbuffers, unsigned int bufferTime){
   datapointertype = DTSC::INVALID;
-  datapointer = 0;
   if (rbuffers < 1){
     rbuffers = 1;
   }
@@ -31,7 +30,7 @@ DTSC::Stream::Stream(unsigned int rbuffers, unsigned int bufferTime){
 /// Returns the time in milliseconds of the last received packet.
 /// This is _not_ the time this packet was received, only the stored time.
 unsigned int DTSC::Stream::getTime(){
-  return buffers.front()["time"].asInt();
+  return buffers.rbegin()->second["time"].asInt();
 }
 
 /// Attempts to parse a packet from the given std::string buffer.
@@ -50,45 +49,40 @@ bool DTSC::Stream::parsePacket(std::string & buffer){
       unsigned int i = 0;
       metadata = JSON::fromDTMI((unsigned char*)buffer.c_str() + 8, len, i);
       metadata.removeMember("moreheader");
+      metadata.netPrepare();
+      trackMapping.clear();
+      if (metadata.isMember("tracks")){
+        for (JSON::ObjIter it = metadata["tracks"].ObjBegin(); it != metadata["tracks"].ObjEnd(); it++){
+          trackMapping.insert(std::pair<int,std::string>(it->second["trackid"].asInt(),it->first));
+        }
+      }
       buffer.erase(0, len + 8);
       if (buffer.length() <= 8){
         return false;
       }
     }
+    int version = 0;
     if (memcmp(buffer.c_str(), DTSC::Magic_Packet, 4) == 0){
+      version = 1;
+    }
+    if (memcmp(buffer.c_str(), DTSC::Magic_Packet2, 4) == 0){
+      version = 2;
+    }
+    if (version){
       len = ntohl(((uint32_t *)buffer.c_str())[1]);
       if (buffer.length() < len + 8){
         return false;
       }
-      buffers.push_front(JSON::Value());
+      JSON::Value newPack;
       unsigned int i = 0;
-      buffers.front() = JSON::fromDTMI((unsigned char*)buffer.c_str() + 8, len, i);
-      datapointertype = INVALID;
-      if (buffers.front().isMember("data")){
-        datapointer = &(buffers.front()["data"].strVal);
-      }else{
-        datapointer = 0;
+      if (version == 1){
+        newPack = JSON::fromDTMI((unsigned char*)buffer.c_str() + 8, len, i);
       }
-      if (buffers.front().isMember("datatype")){
-        std::string tmp = buffers.front()["datatype"].asString();
-        if (tmp == "video"){
-          datapointertype = VIDEO;
-        }
-        if (tmp == "audio"){
-          datapointertype = AUDIO;
-        }
-        if (tmp == "meta"){
-          datapointertype = META;
-        }
-        if (tmp == "pause_marker"){
-          datapointertype = PAUSEMARK;
-        }
+      if (version == 2){
+        newPack = JSON::fromDTMI2((unsigned char*)buffer.c_str() + 8, len, i);
       }
       buffer.erase(0, len + 8);
-      while (buffers.size() > buffercount){
-        buffers.pop_back();
-      }
-      advanceRings();
+      addPacket(newPack);
       syncing = false;
       return true;
     }
@@ -99,10 +93,15 @@ bool DTSC::Stream::parsePacket(std::string & buffer){
     }
 #endif
     size_t magic_search = buffer.find(Magic_Packet);
-    if (magic_search == std::string::npos){
-      buffer.clear();
+    size_t magic_search2 = buffer.find(Magic_Packet2);
+    if (magic_search2 == std::string::npos){
+      if (magic_search == std::string::npos){
+        buffer.clear();
+      }else{
+        buffer.erase(0, magic_search);
+      }
     }else{
-      buffer.erase(0, magic_search);
+      buffer.erase(0, magic_search2);
     }
   }
   return false;
@@ -126,49 +125,40 @@ bool DTSC::Stream::parsePacket(Socket::Buffer & buffer){
       std::string wholepacket = buffer.remove(len + 8);
       metadata = JSON::fromDTMI((unsigned char*)wholepacket.c_str() + 8, len, i);
       metadata.removeMember("moreheader");
-      metadata.netPrepare();
-      if ( !buffer.available(8)){
-        return false;
+      if (buffercount > 1){
+        metadata.netPrepare();
       }
-      header_bytes = buffer.copy(8);
+      if (metadata.isMember("tracks")){
+        trackMapping.clear();
+        for (JSON::ObjIter it = metadata["tracks"].ObjBegin(); it != metadata["tracks"].ObjEnd(); it++){
+          trackMapping.insert(std::pair<int,std::string>(it->second["trackid"].asInt(),it->first));
+        }
+      }
+      //recursively calls itself until failure or data packet instead of header
+      return parsePacket(buffer);
     }
+    int version = 0;
     if (memcmp(header_bytes.c_str(), DTSC::Magic_Packet, 4) == 0){
+      version = 1;
+    }
+    if (memcmp(header_bytes.c_str(), DTSC::Magic_Packet2, 4) == 0){
+      version = 2;
+    }
+    if (version){
       len = ntohl(((uint32_t *)header_bytes.c_str())[1]);
       if ( !buffer.available(len + 8)){
         return false;
       }
-      buffers.push_front(JSON::Value());
+      JSON::Value newPack;
       unsigned int i = 0;
       std::string wholepacket = buffer.remove(len + 8);
-      buffers.front() = JSON::fromDTMI((unsigned char*)wholepacket.c_str() + 8, len, i);
-      datapointertype = INVALID;
-      if (buffers.front().isMember("data")){
-        datapointer = &(buffers.front()["data"].strVal);
-      }else{
-        datapointer = 0;
+      if (version == 1){
+        newPack = JSON::fromDTMI((unsigned char*)wholepacket.c_str() + 8, len, i);
       }
-      if (buffers.front().isMember("datatype")){
-        std::string tmp = buffers.front()["datatype"].asString();
-        if (tmp == "video"){
-          datapointertype = VIDEO;
-        }
-        if (tmp == "audio"){
-          datapointertype = AUDIO;
-        }
-        if (tmp == "meta"){
-          datapointertype = META;
-          //Added by Valur Hrafn to resend last metadata to new streams
-          lastmetapack = buffers.front();
-          lastmetapack.netPrepare();
-        }
-        if (tmp == "pause_marker"){
-          datapointertype = PAUSEMARK;
-        }
+      if (version == 2){
+        newPack = JSON::fromDTMI2((unsigned char*)wholepacket.c_str() + 8, len, i);
       }
-      while (buffers.size() > buffercount){
-        buffers.pop_back();
-      }
-      advanceRings();
+      addPacket(newPack);
       syncing = false;
       return true;
     }
@@ -183,16 +173,231 @@ bool DTSC::Stream::parsePacket(Socket::Buffer & buffer){
   return false;
 }
 
+/// Adds a keyframe packet to all tracks, so the stream can be fully played.
+void DTSC::Stream::endStream(){
+  if (metadata.isMember("tracks") && metadata["tracks"].size() > 0){
+    JSON::Value trackData = metadata["tracks"];
+    for (JSON::ObjIter it = trackData.ObjBegin(); it != trackData.ObjEnd(); it++){
+      if(it->second.isMember("lastms") && it->second.isMember("trackid")){	// TODO
+        JSON::Value newPack;
+        newPack["time"] = it->second["lastms"];
+        newPack["trackid"] = it->second["trackid"];
+        newPack["keyframe"] = 1ll;
+        newPack["data"] = "";
+        addPacket(newPack);
+      }
+    }
+  }
+}
+
+/// Blocks until either the stream has metadata available or the sourceSocket errors.
+/// This function is intended to be run before any commands are sent and thus will not throw away anything important.
+void DTSC::Stream::waitForMeta(Socket::Connection & sourceSocket){
+  while ( !metadata && sourceSocket.connected()){
+    //we have data? attempt to read header
+    if (sourceSocket.Received().size()){
+      //return value is ignore because we're not interested in data packets, just metadata.
+      parsePacket(sourceSocket.Received());
+    }
+    //still no header? check for more data
+    if ( !metadata){
+      if (sourceSocket.spool()){
+        //more received? attempt to read
+        //return value is ignore because we're not interested in data packets, just metadata.
+        parsePacket(sourceSocket.Received());
+      }else{
+        //nothing extra to receive? wait a bit and retry
+        Util::sleep(5);
+      }
+    }
+  }
+}
+
+void DTSC::Stream::addPacket(JSON::Value & newPack){
+  bool updateMeta = false;
+  long long unsigned int now = Util::getMS();
+  livePos newPos;
+  newPos.trackID = newPack["trackid"].asInt();
+  newPos.seekTime = newPack["time"].asInt();
+  if (buffercount > 1 && buffers.size() > 0){
+    livePos lastPos = buffers.rbegin()->first;
+    if (newPos < lastPos){
+      if ((lastPos.seekTime > 1000) && newPos.seekTime < lastPos.seekTime - 1000){
+        metadata["reset"] = 1LL;
+        buffers.clear();
+        keyframes.clear();
+      }else{
+        newPos.seekTime = lastPos.seekTime+1;
+      }
+    }
+  }else{
+    buffers.clear();
+  }
+  std::string newTrack = trackMapping[newPos.trackID];
+  while (buffers.count(newPos) > 0){
+    newPos.seekTime++;
+  }
+  buffers[newPos] = newPack;
+  if (buffercount > 1){
+    buffers[newPos].toNetPacked();//make sure package is packed and ready
+  }
+  datapointertype = INVALID;
+  std::string tmp = "";
+  if (newPack.isMember("trackid")){
+    tmp = getTrackById(newPack["trackid"].asInt())["type"].asStringRef();
+  }
+  if (newPack.isMember("datatype")){
+    tmp = newPack["datatype"].asStringRef();
+  }
+  if (tmp == "video"){
+    datapointertype = VIDEO;
+  }
+  if (tmp == "audio"){
+    datapointertype = AUDIO;
+  }
+  if (tmp == "meta"){
+    datapointertype = META;
+    lastmetapack = newPack;
+    lastmetapack.netPrepare();
+  }
+  if (tmp == "pause_marker"){
+    datapointertype = PAUSEMARK;
+  }
+  int keySize = metadata["tracks"][newTrack]["keys"].size();
+  if (buffercount > 1){
+    #define prevKey metadata["tracks"][newTrack]["keys"][keySize - 1]
+    if (newPack.isMember("keyframe") || !keySize || (datapointertype != VIDEO && newPack["time"].asInt() - 2000 > prevKey["time"].asInt())){
+      updateMeta = true;
+      metadata["tracks"][newTrack]["lastms"] = newPack["time"];
+      keyframes[newPos.trackID].insert(newPos);
+      JSON::Value key;
+      key["time"] = newPack["time"];
+      if (keySize){
+        key["num"] = prevKey["num"].asInt() + 1;
+        prevKey["len"] = newPack["time"].asInt() - prevKey["time"].asInt();
+        int size = 0;
+        for (JSON::ArrIter it = prevKey["parts"].ArrBegin(); it != prevKey["parts"].ArrEnd(); it++){
+          size += it->asInt();
+        }
+        prevKey["partsize"] = prevKey["parts"].size();
+        std::string tmpParts = JSON::encodeVector(prevKey["parts"].ArrBegin(), prevKey["parts"].ArrEnd());
+        prevKey["parts"] = tmpParts;
+        prevKey["size"] = size;
+        long long int bps = (double)prevKey["size"].asInt() / ((double)prevKey["len"].asInt() / 1000.0);
+        if (bps > metadata["tracks"][newTrack]["maxbps"].asInt()){
+          metadata["tracks"][newTrack]["maxbps"] = (long long int)(bps * 1.2);
+        }
+      }else{
+        key["num"] = 1;
+      }
+      metadata["tracks"][newTrack]["keys"].append(key);
+      keySize = metadata["tracks"][newTrack]["keys"].size();
+
+      //find the last fragment
+      JSON::Value lastFrag;
+      if (metadata["tracks"][newTrack]["frags"].size() > 0){
+        lastFrag = metadata["tracks"][newTrack]["frags"][metadata["tracks"][newTrack]["frags"].size() - 1];
+      }
+      //find the first keyframe past the last fragment
+      JSON::ArrIter fragIt = metadata["tracks"][newTrack]["keys"].ArrBegin();
+      while (fragIt != metadata["tracks"][newTrack]["keys"].ArrEnd() && fragIt != metadata["tracks"][newTrack]["keys"].ArrEnd() - 1 && (*fragIt)["num"].asInt() < lastFrag["num"].asInt() + lastFrag["len"].asInt()){
+        fragIt++;
+      }
+      //continue only if a keyframe was found
+      if (fragIt != metadata["tracks"][newTrack]["keys"].ArrEnd() && fragIt != metadata["tracks"][newTrack]["keys"].ArrEnd() - 1){
+        //calculate the variables of the new fragment
+        JSON::Value newFrag;
+        newFrag["num"] = (*fragIt)["num"];
+        newFrag["time"] = (*fragIt)["time"];
+        newFrag["len"] = 1ll;
+        newFrag["dur"] = (*fragIt)["len"];
+        fragIt++;
+        //keep calculating until 10+ seconds or no more keyframes
+        while (fragIt != metadata["tracks"][newTrack]["keys"].ArrEnd() && fragIt != metadata["tracks"][newTrack]["keys"].ArrEnd() - 1){
+          newFrag["len"] = newFrag["len"].asInt() + 1;
+          newFrag["dur"] = newFrag["dur"].asInt() + (*fragIt)["len"].asInt();
+          //more than 5 seconds? store the new fragment
+          if (newFrag["dur"].asInt() >= 5000 || (*fragIt)["len"].asInt() < 2){
+            /// \todo Make this variable instead of hardcoded 5 seconds?
+            metadata["tracks"][newTrack]["frags"].append(newFrag);
+            break;
+          }
+          fragIt++;
+        }
+      }
+    }
+    if (keySize){
+      metadata["tracks"][newTrack]["keys"][keySize - 1]["parts"].append((long long int)newPack["data"].asStringRef().size());
+    }
+    metadata["live"] = 1ll;
+  }
+  
+  //increase buffer size if too little time available
+  unsigned int timeBuffered = buffers.rbegin()->second["time"].asInt() - buffers.begin()->second["time"].asInt();
+  if (buffercount > 1){
+    if (timeBuffered < buffertime){
+      buffercount = buffers.size();
+      if (buffercount < 2){buffercount = 2;}
+    }
+    if (updateMeta && metadata["buffer_window"].asInt() < timeBuffered){
+      metadata["buffer_window"] = (long long int)timeBuffered;
+    }
+  }
+
+  while (buffers.size() > buffercount){
+    if (buffercount > 1 && keyframes[buffers.begin()->first.trackID].count(buffers.begin()->first)){
+      updateMeta = true;
+      //if there are < 3 keyframes, throwing one away would mean less than 2 left.
+      if (keyframes[buffers.begin()->first.trackID].size() < 3){
+        std::cerr << "Warning - track " << buffers.begin()->first.trackID << " doesn't have enough keyframes to be reliably served." << std::endl;
+      }
+      std::string track = trackMapping[buffers.begin()->first.trackID];
+      keyframes[buffers.begin()->first.trackID].erase(buffers.begin()->first);
+      int keySize = metadata["tracks"][track]["keys"].size();
+      metadata["tracks"][track]["keys"].shrink(keySize - 1);
+      if (metadata["tracks"][track]["frags"].size() > 0){
+        // delete fragments of which the beginning can no longer be reached
+        while (metadata["tracks"][track]["frags"].size() > 0 && metadata["tracks"][track]["frags"][0u]["num"].asInt() < metadata["tracks"][track]["keys"][0u]["num"].asInt()){
+          metadata["tracks"][track]["frags"].shrink(metadata["tracks"][track]["frags"].size() - 1);
+          // increase the missed fragments counter
+          metadata["tracks"][track]["missed_frags"] = metadata["tracks"][track]["missed_frags"].asInt() + 1;
+        }
+      }
+    }
+    buffers.erase(buffers.begin());
+  }
+  if (updateMeta){
+    //metadata.netPrepare();
+  }
+}
+
 /// Returns a direct pointer to the data attribute of the last received packet, if available.
 /// Returns NULL if no valid pointer or packet is available.
 std::string & DTSC::Stream::lastData(){
-  return *datapointer;
+  return buffers.rbegin()->second["data"].strVal;
 }
 
 /// Returns the packet in this buffer number.
 /// \arg num Buffer number.
-JSON::Value & DTSC::Stream::getPacket(unsigned int num){
+JSON::Value & DTSC::Stream::getPacket(livePos num){
+  static JSON::Value empty;
+  if (buffers.find(num) == buffers.end()){
+    return empty;
+  }
   return buffers[num];
+}
+
+JSON::Value & DTSC::Stream::getPacket(){
+  return buffers.begin()->second;
+}
+
+/// Returns a track element by giving the id.
+JSON::Value & DTSC::Stream::getTrackById(int trackNo){
+  static JSON::Value empty;
+  if (trackMapping.find(trackNo) != trackMapping.end()){
+    return metadata["tracks"][trackMapping[trackNo]];
+  }
+  return empty;
 }
 
 /// Returns the type of the last received packet.
@@ -214,10 +419,18 @@ void DTSC::Stream::setBufferTime(unsigned int ms){
   buffertime = ms;
 }
 
-/// Returns a packed DTSC packet, ready to sent over the network.
-std::string & DTSC::Stream::outPacket(unsigned int num){
+std::string & DTSC::Stream::outPacket(){
   static std::string emptystring;
-  if (num >= buffers.size() || !buffers[num].isObject()) return emptystring;
+  if (!buffers.size() || !buffers.rbegin()->second.isObject()){
+    return emptystring;
+  }
+  return buffers.rbegin()->second.toNetPacked();
+}
+
+/// Returns a packed DTSC packet, ready to sent over the network.
+std::string & DTSC::Stream::outPacket(livePos num){
+  static std::string emptystring;
+  if (buffers.find(num) == buffers.end() || !buffers[num].isObject()) return emptystring;
   return buffers[num].toNetPacked();
 }
 
@@ -226,63 +439,9 @@ std::string & DTSC::Stream::outHeader(){
   return metadata.toNetPacked();
 }
 
-/// advances all given out and internal Ring classes to point to the new buffer, after one has been added.
-/// Also updates the internal keyframes ring, as well as marking rings as starved if they are.
-/// Unsets waiting rings, updating them with their new buffer number.
-void DTSC::Stream::advanceRings(){
-  std::deque<DTSC::Ring>::iterator dit;
-  std::set<DTSC::Ring *>::iterator sit;
-  if (rings.size()){
-    for (sit = rings.begin(); sit != rings.end(); sit++){
-      ( *sit)->b++;
-      if (( *sit)->waiting){
-        ( *sit)->waiting = false;
-        ( *sit)->b = 0;
-      }
-      if (( *sit)->starved || (( *sit)->b >= buffers.size())){
-        ( *sit)->starved = true;
-        ( *sit)->b = 0;
-      }
-    }
-  }
-  if (keyframes.size()){
-    for (dit = keyframes.begin(); dit != keyframes.end(); dit++){
-      dit->b++;
-    }
-    bool repeat;
-    do{
-      repeat = false;
-      for (dit = keyframes.begin(); dit != keyframes.end(); dit++){
-        if (dit->b >= buffers.size()){
-          keyframes.erase(dit);
-          repeat = true;
-          break;
-        }
-      }
-    }while (repeat);
-  }
-  static int fragNum = 1;
-  static unsigned int lastkeytime = 4242;
-  if ((lastType() == VIDEO && buffers.front().isMember("keyframe")) || (!metadata.isMember("video") && buffers.front()["time"].asInt() / 2000 != lastkeytime)){
-    keyframes.push_front(DTSC::Ring(0));
-    if ( !buffers.front().isMember("fragnum")){
-      buffers.front()["fragnum"] = fragNum++;
-    }
-    lastkeytime = buffers.front()["time"].asInt() / 2000;
-  }
-  unsigned int timeBuffered = 0;
-  if (keyframes.size() > 1){
-    //increase buffer size if no keyframes available or too little time available
-    timeBuffered = buffers[keyframes[0].b]["time"].asInt() - buffers[keyframes[keyframes.size() - 1].b]["time"].asInt();
-  }
-  if (buffercount > 1 && (keyframes.size() < 2 || timeBuffered < buffertime)){
-    buffercount++;
-  }
-}
-
 /// Constructs a new Ring, at the given buffer position.
 /// \arg v Position for buffer.
-DTSC::Ring::Ring(unsigned int v){
+DTSC::Ring::Ring(livePos v){
   b = v;
   waiting = false;
   starved = false;
@@ -294,188 +453,112 @@ DTSC::Ring::Ring(unsigned int v){
 /// This Ring will be kept updated so it always points to valid data or has the starved boolean set.
 /// Don't forget to call dropRing() for all requested Ring classes that are no longer neccessary!
 DTSC::Ring * DTSC::Stream::getRing(){
-  DTSC::Ring * tmp;
-  if (keyframes.size() == 0){
-    tmp = new DTSC::Ring(0);
-  }else{
-   // Changed by Valur Hrafn was:
-   // tmp = new DTSC::Ring(keyframes[0].b);
-     tmp = new DTSC::Ring(keyframes[keyframes.size()/2].b);
+  livePos tmp = buffers.begin()->first;
+  std::map<int,std::set<livePos> >::iterator it;
+  for (it = keyframes.begin(); it != keyframes.end(); it++){
+    if ((*it->second.begin()).seekTime > tmp.seekTime){
+      tmp = *it->second.begin();
+    }
   }
-  rings.insert(tmp);
-  return tmp;
+  return new DTSC::Ring(tmp);
 }
 
 /// Deletes a given out Ring class from memory and internal Ring list.
 /// Checks for NULL pointers and invalid pointers, silently discarding them.
 void DTSC::Stream::dropRing(DTSC::Ring * ptr){
-  if (rings.find(ptr) != rings.end()){
-    rings.erase(ptr);
-    delete ptr;
-  }
-}
-
-/// Updates the headers for a live stream, keeping track of all available
-/// keyframes and their media times. The function MAY NOT be run at any other
-/// time than right after receiving a new keyframe, or there'll be raptors.
-void DTSC::Stream::updateHeaders(){
-  if (keyframes.size() > 2){
-    if (buffers[keyframes[0].b]["time"].asInt() < buffers[keyframes[keyframes.size() - 1].b]["time"].asInt()){
-      std::cerr << "Detected new video - resetting all buffers and metadata - hold on, this ride might get bumpy!" << std::endl;
-      keyframes.clear();
-      buffers.clear();
-      std::set<DTSC::Ring *>::iterator sit;
-      if (rings.size()){
-        for (sit = rings.begin(); sit != rings.end(); sit++){
-          ( *sit)->updated = true;
-          ( *sit)->b = 0;
-          ( *sit)->starved = true;
-        }
-      }
-      metadata.removeMember("keytime");
-      metadata.removeMember("keynum");
-      metadata.removeMember("keylen");
-      metadata.removeMember("frags");
-      metadata.removeMember("lastms");
-      metadata.removeMember("missed_frags");
-      metadata.netPrepare();
-      return;
-    }
-    metadata["keytime"].shrink(keyframes.size() - 2);
-    metadata["keynum"].shrink(keyframes.size() - 2);
-    metadata["keylen"].shrink(keyframes.size() - 2);
-    metadata["keytime"].append(buffers[keyframes[1].b]["time"].asInt());
-    metadata["keynum"].append(buffers[keyframes[1].b]["fragnum"].asInt());
-    metadata["keylen"].append(buffers[keyframes[0].b]["time"].asInt() - buffers[keyframes[1].b]["time"].asInt());
-    unsigned int fragStart = 0;
-    if ( !metadata["frags"]){
-      // this means that if we have < ~10 seconds in the buffer, fragmenting goes horribly wrong.
-      if ( !metadata.isMember("missed_frags")){
-        metadata["missed_frags"] = 0ll;
-      }
-    }else{
-      // delete fragments of which the beginning can no longer be reached
-      while (metadata["frags"][0u]["num"].asInt() < metadata["keynum"][0u].asInt()){
-        metadata["frags"].shrink(metadata["frags"].size() - 1);
-        // increase the missed fragments counter
-        metadata["missed_frags"] = metadata["missed_frags"].asInt() + 1;
-      }
-      if (metadata["frags"].size() > 0){
-        // set oldestFrag to the first keynum outside any current fragment
-        long long unsigned int oldestFrag = metadata["frags"][metadata["frags"].size() - 1]["num"].asInt() + metadata["frags"][metadata["frags"].size() - 1]["len"].asInt();
-        // seek fragStart to the first keynum >= oldestFrag
-        while (metadata["keynum"][fragStart].asInt() < oldestFrag){
-          fragStart++;
-        }
-      }
-    }
-    for (unsigned int i = fragStart; i < metadata["keytime"].size(); i++){
-      if (i == fragStart){
-        long long int currFrag = metadata["keytime"][i].asInt() / 10000;
-        long long int fragLen = 1;
-        long long int fragDur = metadata["keylen"][i].asInt();
-        for (unsigned int j = i + 1; j < metadata["keytime"].size(); j++){
-          // if we are now 10+ seconds, finish the fragment
-          if (fragDur >= 10000){
-            // construct and append the fragment
-            JSON::Value thisFrag;
-            thisFrag["num"] = metadata["keynum"][i];
-            thisFrag["len"] = fragLen;
-            thisFrag["dur"] = fragDur;
-            metadata["frags"].append(thisFrag);
-            // next fragment starts fragLen fragments up
-            fragStart += fragLen;
-            // skip that many - no unneeded looping
-            i += fragLen - 1;
-            break;
-          }
-          // otherwise, +1 the length and add up the duration
-          fragLen++;
-          fragDur += metadata["keylen"][j].asInt();
-        }
-      }
-    }
-    metadata["lastms"] = buffers[keyframes[0].b]["time"].asInt();
-    metadata["buffer_window"] = (long long int)buffertime;
-    metadata["live"] = true;
-    metadata.netPrepare();
-    updateRingHeaders();
-  }
-}
-
-void DTSC::Stream::updateRingHeaders(){
-  std::set<DTSC::Ring *>::iterator sit;
-  if ( !rings.size()){
-    return;
-  }
-  for (sit = rings.begin(); sit != rings.end(); sit++){
-    ( *sit)->updated = true;
-  }
 }
 
 /// Returns 0 if seeking is possible, -1 if the wanted frame is too old, 1 if the wanted frame is too new.
+/// This function looks in the header - not in the buffered data itself.
 int DTSC::Stream::canSeekms(unsigned int ms){
-  if ( !metadata["keytime"].size()){
+  bool too_late = false;
+  //no tracks? Frame too new by definition.
+  if ( !metadata.isMember("tracks") || metadata["tracks"].size() < 1){
     return 1;
   }
-  if (ms > metadata["keytime"][metadata["keytime"].size() - 1].asInt()){
-    return 1;
-  }
-  if (ms < metadata["keytime"][0u].asInt()){
-    return -1;
-  }
-  return 0;
-}
-
-/// Returns 0 if seeking is possible, -1 if the wanted frame is too old, 1 if the wanted frame is too new.
-int DTSC::Stream::canSeekFrame(unsigned int frameno){
-  if ( !metadata["keynum"].size()){
-    return 1;
-  }
-  if (frameno > metadata["keynum"][metadata["keynum"].size() - 1].asInt()){
-    return 1;
-  }
-  if (frameno < metadata["keynum"][0u].asInt()){
-    return -1;
-  }
-  return 0;
-}
-
-unsigned int DTSC::Stream::msSeek(unsigned int ms){
-  if (ms > buffers[keyframes[0u].b]["time"].asInt()){
-    std::cerr << "Warning: seeking past ingest! (" << ms << "ms > " << buffers[keyframes[0u].b]["time"].asInt() << "ms)" << std::endl;
-    return keyframes[0u].b;
-  }
-  for (std::deque<DTSC::Ring>::iterator it = keyframes.begin(); it != keyframes.end(); it++){
-    if (buffers[it->b]["time"].asInt() <= ms){
-      return it->b;
+  //loop trough all the tracks
+  for (JSON::ObjIter it = metadata["tracks"].ObjBegin(); it != metadata["tracks"].ObjEnd(); it++){
+    if (it->second.isMember("keys") && it->second["keys"].size() > 0){
+      if (it->second["keys"][0u]["time"].asInt() <= ms && it->second["keys"][it->second["keys"].size() - 1]["time"].asInt() >= ms){
+        return 0;
+      }
+      if (it->second["keys"][0u]["time"].asInt() > ms){too_late = true;}
     }
   }
-  std::cerr << "Warning: seeking past buffer size! (" << ms << "ms < " << buffers[keyframes[keyframes.size() - 1].b]["time"].asInt() << "ms)" << std::endl;
-  return keyframes[keyframes.size() - 1].b;
+  //did we spot a track already past this point? return too late.
+  if (too_late){return -1;}
+  //otherwise, assume not available yet
+  return 1;
 }
 
-unsigned int DTSC::Stream::frameSeek(unsigned int frameno){
-  if (frameno > buffers[keyframes[0u].b]["fragnum"].asInt()){
-    std::cerr << "Warning: seeking past ingest! (F" << frameno << " > F" << buffers[keyframes[0u].b]["fragnum"].asInt() << ")" << std::endl;
-    return keyframes[0u].b;
-  }
-  for (std::deque<DTSC::Ring>::iterator it = keyframes.begin(); it != keyframes.end(); it++){
-    if (buffers[it->b]["fragnum"].asInt() == frameno){
-      return it->b;
+DTSC::livePos DTSC::Stream::msSeek(unsigned int ms, std::set<int> & allowedTracks){
+  std::set<int> seekTracks = allowedTracks;
+  livePos result = buffers.begin()->first;
+  for (std::set<int>::iterator it = allowedTracks.begin(); it != allowedTracks.end(); it++){
+    if (getTrackById(*it).isMember("type") && getTrackById(*it)["type"].asStringRef() == "video"){
+      int trackNo = *it;
+      seekTracks.clear();
+      seekTracks.insert(trackNo);
+      break;
     }
   }
-  std::cerr << "Warning: seeking past buffer size! (F" << frameno << " < F" << buffers[keyframes[keyframes.size() - 1].b]["fragnum"].asInt() << ")" << std::endl;
-  return keyframes[keyframes.size() - 1].b;
+  for (std::map<livePos,JSON::Value>::iterator bIt = buffers.begin(); bIt != buffers.end(); bIt++){
+    if (seekTracks.find(bIt->first.trackID) != seekTracks.end()){
+      if (bIt->second.isMember("keyframe")){
+        result = bIt->first;
+        if (bIt->first.seekTime >= ms){
+          return result;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+bool DTSC::Stream::isNewest(DTSC::livePos & pos){
+  return (buffers.upper_bound(pos) == buffers.end());
+}
+
+DTSC::livePos DTSC::Stream::getNext(DTSC::livePos & pos, std::set<int> & allowedTracks){
+  if (!isNewest(pos)){
+    return (buffers.upper_bound(pos))->first;
+  }else{
+    return livePos();
+  }
 }
 
 /// Properly cleans up the object for erasing.
 /// Drops all Ring classes that have been given out.
 DTSC::Stream::~Stream(){
-  std::set<DTSC::Ring *>::iterator sit;
-  for (sit = rings.begin(); sit != rings.end(); sit++){
-    delete ( *sit);
+}
+
+DTSC::File::File(){
+  F = 0;
+  endPos = 0;
+}
+
+DTSC::File::File(const File & rhs){
+  *this = rhs;
+}
+
+DTSC::File & DTSC::File::operator =(const File & rhs){
+  created = rhs.created;
+  if (rhs.F){
+    int tmpFd = fileno(rhs.F);
+    int newFd = dup(tmpFd);
+    F = fdopen( newFd, (created ? "w+b": "r+b"));
+  }else{
+    F = 0;
   }
+  endPos = rhs.endPos;
+  strbuffer = rhs.strbuffer;
+  jsonbuffer = rhs.jsonbuffer;
+  metadata = rhs.metadata;
+  currtime = rhs.currtime;
+  lastreadpos = rhs.lastreadpos;
+  headerSize = rhs.headerSize;
+  trackMapping = rhs.trackMapping;
+  memcpy(buffer, rhs.buffer, 4);
 }
 
 /// Open a filename for DTSC reading/writing.
@@ -492,10 +575,13 @@ DTSC::File::File(std::string filename, bool create){
   }else{
     F = fopen(filename.c_str(), "r+b");
   }
+  created = create;
   if ( !F){
     fprintf(stderr, "Could not open file %s\n", filename.c_str());
     return;
   }
+  fseek(F, 0, SEEK_END);
+  endPos = ftell(F);
 
   //we now know the first 4 bytes are DTSC::Magic_Header and we have a valid file
   fseek(F, 4, SEEK_SET);
@@ -508,21 +594,19 @@ DTSC::File::File(std::string filename, bool create){
     headerSize = ntohl(ubuffer[0]);
   }
   readHeader(0);
+  trackMapping.clear();
+  if (metadata.isMember("tracks")){
+    for (JSON::ObjIter it = metadata["tracks"].ObjBegin(); it != metadata["tracks"].ObjEnd(); it++){
+      trackMapping.insert(std::pair<int,std::string>(it->second["trackid"].asInt(),it->first));
+    }
+  }
   fseek(F, 8 + headerSize, SEEK_SET);
   currframe = 0;
-  //currframe = 1;
-  //frames[1] = 8 + headerSize;
-  //msframes[1] = 0;
 }
 
 /// Returns the header metadata for this file as JSON::Value.
 JSON::Value & DTSC::File::getMeta(){
   return metadata;
-}
-
-/// Returns the header metadata for this file as JSON::Value.
-JSON::Value & DTSC::File::getFirstMeta(){
-  return firstmetadata;
 }
 
 /// (Re)writes the given string to the header area if the size is the same as the existing header.
@@ -533,6 +617,12 @@ bool DTSC::File::writeHeader(std::string & header, bool force){
     return false;
   }
   headerSize = header.size();
+  int pSize = htonl(header.size());
+  fseek(F, 4, SEEK_SET);
+  int tmpret = fwrite((void*)( &pSize), 4, 1, F);
+  if (tmpret != 1){
+    return false;
+  }
   fseek(F, 8, SEEK_SET);
   int ret = fwrite(header.c_str(), headerSize, 1, F);
   fseek(F, 8 + headerSize, SEEK_SET);
@@ -557,6 +647,8 @@ long long int DTSC::File::addHeader(std::string & header){
   if (ret != 1){
     return 0;
   }
+  fseek(F, 0, SEEK_END);
+  endPos = ftell(F);
   return writePos; //return position written at
 }
 
@@ -592,41 +684,59 @@ void DTSC::File::readHeader(int pos){
   uint32_t * ubuffer = (uint32_t *)buffer;
   long packSize = ntohl(ubuffer[0]);
   strbuffer.resize(packSize);
-  if (fread((void*)strbuffer.c_str(), packSize, 1, F) != 1){
-    fprintf(stderr, "Could not read packet (H%i)\n", pos);
-    strbuffer = "";
-    metadata.null();
-    return;
-  }
-  metadata = JSON::fromDTMI(strbuffer);
-  if (pos == 0){
-    firstmetadata = metadata;
+  if (packSize){
+    if (fread((void*)strbuffer.c_str(), packSize, 1, F) != 1){
+      fprintf(stderr, "Could not read packet (H%i)\n", pos);
+      strbuffer = "";
+      metadata.null();
+      return;
+    }
+    metadata = JSON::fromDTMI(strbuffer);
   }
   //if there is another header, read it and replace metadata with that one.
   if (metadata.isMember("moreheader") && metadata["moreheader"].asInt() > 0){
-    readHeader(metadata["moreheader"].asInt());
-    return;
-  }
-  if (metadata.isMember("keytime")){
-    msframes.clear();
-    for (int i = 0; i < metadata["keytime"].size(); ++i){
-      msframes[i + 1] = metadata["keytime"][i].asInt();
-    }
-  }
-  if (metadata.isMember("keybpos")){
-    frames.clear();
-    for (int i = 0; i < metadata["keybpos"].size(); ++i){
-      frames[i + 1] = metadata["keybpos"][i].asInt();
+    if (metadata["moreheader"].asInt() < getBytePosEOF()){
+      readHeader(metadata["moreheader"].asInt());
+      return;
     }
   }
   metadata["vod"] = true;
   metadata.netPrepare();
 }
 
+long int DTSC::File::getBytePosEOF(){
+  return endPos;
+}
+
+long int DTSC::File::getBytePos(){
+  return ftell(F);
+}
+
+bool DTSC::File::reachedEOF(){
+  return feof(F);
+}
+
 /// Reads the packet available at the current file position.
 /// If the packet could not be read for any reason, the reason is printed to stderr.
 /// Reading the packet means the file position is increased to the next packet.
 void DTSC::File::seekNext(){
+  if ( !currentPositions.size()){
+    strbuffer = "";
+    jsonbuffer.null();
+    return;
+  }
+  fseek(F,currentPositions.begin()->bytePos, SEEK_SET);
+  if ( reachedEOF()){
+    strbuffer = "";
+    jsonbuffer.null();
+    return;
+  }
+  clearerr(F);
+  if ( !metadata.isMember("merged") || !metadata["merged"]){
+    seek_time(currentPositions.begin()->seekTime + 1, currentPositions.begin()->trackID);
+  }
+  fseek(F,currentPositions.begin()->bytePos, SEEK_SET);
+  currentPositions.erase(currentPositions.begin());
   lastreadpos = ftell(F);
   if (fread(buffer, 4, 1, F) != 1){
     if (feof(F)){
@@ -645,8 +755,15 @@ void DTSC::File::seekNext(){
     jsonbuffer = metadata;
     return;
   }
-  if (memcmp(buffer, DTSC::Magic_Packet, 4) != 0){
-    fprintf(stderr, "Invalid header - %.4s != %.4s\n", buffer, DTSC::Magic_Packet);
+  long long unsigned int version = 0;
+  if (memcmp(buffer, DTSC::Magic_Packet, 4) == 0){
+    version = 1;
+  }
+  if (memcmp(buffer, DTSC::Magic_Packet2, 4) == 0){
+    version = 2;
+  }
+  if (version == 0){
+    fprintf(stderr, "Invalid packet header @ %#x - %.4s != %.4s\n", lastreadpos, buffer, DTSC::Magic_Packet2);
     strbuffer = "";
     jsonbuffer.null();
     return;
@@ -666,21 +783,123 @@ void DTSC::File::seekNext(){
     jsonbuffer.null();
     return;
   }
-  jsonbuffer = JSON::fromDTMI(strbuffer);
-  if (jsonbuffer.isMember("keyframe")){
-    if (frames[currframe] != lastreadpos){
-      currframe++;
-      currtime = jsonbuffer["time"].asInt();
-#if DEBUG >= 6
-      if (frames[currframe] != lastreadpos){
-        std::cerr << "Found a new frame " << currframe << " @ " << lastreadpos << "b/" << currtime << "ms" << std::endl;
-      } else{
-        std::cerr << "Passing frame " << currframe << " @ " << lastreadpos << "b/" << currtime << "ms" << std::endl;
+  if (version == 2){
+    jsonbuffer = JSON::fromDTMI2(strbuffer);
+  }else{
+    jsonbuffer = JSON::fromDTMI(strbuffer);
+  }
+  if (metadata.isMember("merged") && metadata["merged"]){
+    int tempLoc = getBytePos();
+    char newHeader[20];
+    if (fread((void*)newHeader, 20, 1, F) == 1){
+      if (memcmp(newHeader, DTSC::Magic_Packet2, 4) == 0){
+        seekPos tmpPos;
+        tmpPos.bytePos = tempLoc;
+        tmpPos.trackID = ntohl(((int*)newHeader)[2]);
+        if (selectedTracks.find(tmpPos.trackID) != selectedTracks.end()){
+          tmpPos.seekTime = ((long long unsigned int)ntohl(((int*)newHeader)[3])) << 32;
+          tmpPos.seekTime += ntohl(((int*)newHeader)[4]);
+        }else{
+          tmpPos.seekTime = -1;
+          for (JSON::ArrIter it = getTrackById(jsonbuffer["trackid"].asInt())["keys"].ArrBegin(); it != getTrackById(jsonbuffer["trackid"].asInt())["keys"].ArrEnd(); it++){
+            if ((*it)["time"].asInt() > jsonbuffer["time"].asInt()){
+              tmpPos.seekTime = (*it)["time"].asInt();
+              tmpPos.bytePos = (*it)["bpos"].asInt();
+              tmpPos.trackID = jsonbuffer["trackid"].asInt();
+              break;
+            }
+          }
+        }
+        if (tmpPos.seekTime != -1){
+          bool insert = true;
+          for (std::set<seekPos>::iterator curPosIter = currentPositions.begin(); curPosIter != currentPositions.end(); curPosIter++){
+            if ((*curPosIter).trackID == tmpPos.trackID && (*curPosIter).seekTime >= tmpPos.seekTime){
+              insert = false;
+              break;
+            }
+          }
+          if (insert){
+            currentPositions.insert(tmpPos);
+          }else{
+            seek_time(jsonbuffer["time"].asInt() + 1, jsonbuffer["trackid"].asInt(), true);
+          }
+        }
       }
-#endif
-      frames[currframe] = lastreadpos;
-      msframes[currframe] = currtime;
     }
+  }
+}
+
+
+void DTSC::File::parseNext(){
+  lastreadpos = ftell(F);
+  if (fread(buffer, 4, 1, F) != 1){
+    if (feof(F)){
+#if DEBUG >= 4
+      fprintf(stderr, "End of file reached.\n");
+#endif
+    }else{
+      fprintf(stderr, "Could not read header\n");
+    }
+    strbuffer = "";
+    jsonbuffer.null();
+    return;
+  }
+  if (memcmp(buffer, DTSC::Magic_Header, 4) == 0){
+    if (lastreadpos != 0){
+      readHeader(lastreadpos);
+      jsonbuffer = metadata;
+    }else{
+      if (fread(buffer, 4, 1, F) != 1){
+        fprintf(stderr, "Could not read size\n");
+        strbuffer = "";
+        jsonbuffer.null();
+        return;
+      }
+      uint32_t * ubuffer = (uint32_t *)buffer;
+      long packSize = ntohl(ubuffer[0]);
+      strbuffer.resize(packSize);
+      if (fread((void*)strbuffer.c_str(), packSize, 1, F) != 1){
+        fprintf(stderr, "Could not read packet\n");
+        strbuffer = "";
+        jsonbuffer.null();
+        return;
+      }
+      jsonbuffer = JSON::fromDTMI(strbuffer);
+    }
+    return;
+  }
+  long long unsigned int version = 0;
+  if (memcmp(buffer, DTSC::Magic_Packet, 4) == 0){
+    version = 1;
+  }
+  if (memcmp(buffer, DTSC::Magic_Packet2, 4) == 0){
+    version = 2;
+  }
+  if (version == 0){
+    fprintf(stderr, "Invalid packet header @ %#x - %.4s != %.4s\n", lastreadpos, buffer, DTSC::Magic_Packet2);
+    strbuffer = "";
+    jsonbuffer.null();
+    return;
+  }
+  if (fread(buffer, 4, 1, F) != 1){
+    fprintf(stderr, "Could not read size\n");
+    strbuffer = "";
+    jsonbuffer.null();
+    return;
+  }
+  uint32_t * ubuffer = (uint32_t *)buffer;
+  long packSize = ntohl(ubuffer[0]);
+  strbuffer.resize(packSize);
+  if (fread((void*)strbuffer.c_str(), packSize, 1, F) != 1){
+    fprintf(stderr, "Could not read packet\n");
+    strbuffer = "";
+    jsonbuffer.null();
+    return;
+  }
+  if (version == 2){
+    jsonbuffer = JSON::fromDTMI2(strbuffer);
+  }else{
+    jsonbuffer = JSON::fromDTMI(strbuffer);
   }
 }
 
@@ -699,72 +918,119 @@ JSON::Value & DTSC::File::getJSON(){
   return jsonbuffer;
 }
 
-/// Attempts to seek to the given frame number within the file.
-/// Returns true if successful, false otherwise.
-bool DTSC::File::seek_frame(int frameno){
-  if (frames.count(frameno) > 0){
-    if (fseek(F, frames[frameno], SEEK_SET) == 0){
-#if DEBUG >= 5
-      std::cerr << "Seek direct from " << currframe << " @ " << frames[currframe] << " to " << frameno << " @ " << frames[frameno] << std::endl;
-#endif
-      currframe = frameno;
-      return true;
-    }
+/// Returns a track element by giving the id.
+JSON::Value & DTSC::File::getTrackById(int trackNo){
+  static JSON::Value empty;
+  if (trackMapping.find(trackNo) != trackMapping.end()){
+    return metadata["tracks"][trackMapping[trackNo]];
+  }
+  return empty;
+}
+
+bool DTSC::File::seek_time(int ms, int trackNo, bool forceSeek){
+  seekPos tmpPos;
+  tmpPos.trackID = trackNo;
+  if (!forceSeek && jsonbuffer && ms > jsonbuffer["time"].asInt() && trackNo >= jsonbuffer["trackid"].asInt()){
+    tmpPos.seekTime = jsonbuffer["time"].asInt();
+    tmpPos.bytePos = getBytePos();
   }else{
-    for (int i = frameno; i >= 1; --i){
-      if (frames.count(i) > 0){
-        currframe = i;
-        break;
-      }
+    tmpPos.seekTime = 0;
+    tmpPos.bytePos = 0;
+  }
+  JSON::Value & keys = metadata["tracks"][trackMapping[trackNo]]["keys"];
+  for (JSON::ArrIter keyIt = keys.ArrBegin(); keyIt != keys.ArrEnd(); keyIt++){
+    if ((*keyIt)["time"].asInt() > ms){
+      break;
     }
-    if (fseek(F, frames[currframe], SEEK_SET) == 0){
-#if DEBUG >= 5
-      std::cerr << "Seeking from frame " << currframe << " @ " << frames[currframe] << " to " << frameno << std::endl;
-#endif
-      while (currframe < frameno){
-        seekNext();
-        if (jsonbuffer.isNull()){
-          return false;
-        }
-      }
-      seek_frame(frameno);
-      return true;
+    if ((*keyIt)["time"].asInt() > tmpPos.seekTime){
+      tmpPos.seekTime = (*keyIt)["time"].asInt();
+      tmpPos.bytePos = (*keyIt)["bpos"].asInt();
     }
   }
-  return false;
+  bool foundPacket = false;
+  while ( !foundPacket){
+    lastreadpos = ftell(F);
+    if (reachedEOF()){
+      return false;
+    }
+    //Seek to first packet after ms.
+    seek_bpos(tmpPos.bytePos);
+    //read the header
+    char header[20];
+    fread((void*)header, 20, 1, F);
+    //check if packetID matches, if not, skip size + 8 bytes.
+    int packSize = ntohl(((int*)header)[1]);
+    int packID = ntohl(((int*)header)[2]);
+    if (memcmp(header,Magic_Packet2,4) != 0 || packID != trackNo){
+      tmpPos.bytePos += 8 + packSize;
+      continue;
+    }
+    //get timestamp of packet, if too large, break, if not, skip size bytes.
+    long long unsigned int myTime = ((long long unsigned int)ntohl(((int*)header)[3]) << 32);
+    myTime += ntohl(((int*)header)[4]);
+    tmpPos.seekTime = myTime;
+    if (myTime >= ms){
+      foundPacket = true;
+    }else{
+      tmpPos.bytePos += 8 + packSize;
+      continue;
+    }
+  }
+  currentPositions.insert(tmpPos);
+  //fprintf(stderr,"Seek_time to %d on track %d, time %d on track %d found\n", ms, trackNo, tmpPos.seekTime,tmpPos.trackID);
 }
 
 /// Attempts to seek to the given time in ms within the file.
 /// Returns true if successful, false otherwise.
 bool DTSC::File::seek_time(int ms){
-  std::map<int, long>::iterator it;
-  currtime = 0;
-  currframe = 1;
-  for (it = msframes.begin(); it != msframes.end(); ++it){
-    if (it->second > ms){
-      break;
-    }
-    if (it->second > currtime){
-      currtime = it->second;
-      currframe = it->first;
-    }
+  currentPositions.clear();
+  seekPos tmpPos;
+  for (std::set<int>::iterator it = selectedTracks.begin(); it != selectedTracks.end(); it++){
+    seek_bpos(0);
+    seek_time(ms,(*it));
   }
-  if (fseek(F, frames[currframe], SEEK_SET) == 0){
-#if DEBUG >= 5
-    std::cerr << "Seeking from frame " << currframe << " @ " << msframes[currframe] << "ms to " << ms << "ms" << std::endl;
-#endif
-    while (currtime < ms){
-      seekNext();
-      if (jsonbuffer.isNull()){
-        return false;
-      }
-    }
-    if (currtime > ms){
-      return seek_frame(currframe - 1);
-    }
+  return true;
+}
+
+bool DTSC::File::seek_bpos(int bpos){
+  if (fseek(F, bpos, SEEK_SET) == 0){
     return true;
   }
   return false;
+}
+
+void DTSC::File::writePacket(std::string & newPacket){
+  fseek(F, 0, SEEK_END);
+  fwrite(newPacket.c_str(), newPacket.size(), 1, F); //write contents
+  fseek(F, 0, SEEK_END);
+  endPos = ftell(F);
+}
+
+void DTSC::File::writePacket(JSON::Value & newPacket){
+  writePacket(newPacket.toNetPacked());
+}
+
+bool DTSC::File::atKeyframe(){
+  if (getJSON().isMember("keyframe")){
+    return true;
+  }
+  long long int bTime = jsonbuffer["time"].asInt();
+  JSON::Value & keys = getTrackById(jsonbuffer["trackid"].asInt())["keys"];
+  for (JSON::ArrIter aIt = keys.ArrBegin(); aIt != keys.ArrEnd(); ++aIt){
+    if ((*aIt)["time"].asInt() >= bTime){
+      return ((*aIt)["time"].asInt() == bTime);
+    }
+  }
+  return false;
+}
+
+void DTSC::File::selectTracks(std::set<int> & tracks){
+  selectedTracks = tracks;
+  if ( !currentPositions.size()){
+    seek_time(0);
+  }else{
+    currentPositions.clear();
+  }
 }
 
 /// Close the file if open
@@ -773,4 +1039,16 @@ DTSC::File::~File(){
     fclose(F);
     F = 0;
   }
+}
+
+
+bool DTSC::isFixed(JSON::Value & metadata){
+  if (metadata.isMember("is_fixed")){return true;}
+  if ( !metadata.isMember("tracks")){return false;}
+  for (JSON::ObjIter it = metadata["tracks"].ObjBegin(); it != metadata["tracks"].ObjEnd(); it++){
+    if (!(it->second.isMember("keys") && it->second["keys"].isArray() && it->second["keys"][0u].isMember("bpos"))){
+      return false;
+    }
+  }
+  return true;
 }

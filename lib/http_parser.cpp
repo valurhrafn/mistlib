@@ -2,10 +2,12 @@
 /// Holds all code for the HTTP namespace.
 
 #include "http_parser.h"
+#include "timing.h"
 
 /// This constructor creates an empty HTTP::Parser, ready for use for either reading or writing.
 /// All this constructor does is call HTTP::Parser::Clean().
 HTTP::Parser::Parser(){
+  headerOnly = false;
   Clean();
 }
 
@@ -44,6 +46,27 @@ std::string & HTTP::Parser::BuildRequest(){
   return builder;
 }
 
+/// Creates and sends a valid HTTP 1.0 or 1.1 request.
+/// The request is build from internal variables set before this call is made.
+/// To be precise, method, url, protocol, headers and body are used.
+void HTTP::Parser::SendRequest(Socket::Connection & conn){
+  /// \todo Include GET/POST variable parsing?
+  std::map<std::string, std::string>::iterator it;
+  if (protocol.size() < 5 || protocol.substr(0, 4) != "HTTP"){
+    protocol = "HTTP/1.0";
+  }
+  builder = method + " " + url + " " + protocol + "\r\n";
+  conn.SendNow(builder);
+  for (it = headers.begin(); it != headers.end(); it++){
+    if (( *it).first != "" && ( *it).second != ""){
+      builder = ( *it).first + ": " + ( *it).second + "\r\n";
+      conn.SendNow(builder);
+    }
+  }
+  conn.SendNow("\r\n", 2);
+  conn.SendNow(body);
+}
+
 /// Returns a string containing a valid HTTP 1.0 or 1.1 response, ready for sending.
 /// The response is partly build from internal variables set before this call is made.
 /// To be precise, protocol, headers and body are used.
@@ -67,6 +90,146 @@ std::string & HTTP::Parser::BuildResponse(std::string code, std::string message)
   builder += "\r\n";
   builder += body;
   return builder;
+}
+
+/// Creates and sends a valid HTTP 1.0 or 1.1 response.
+/// The response is partly build from internal variables set before this call is made.
+/// To be precise, protocol, headers and body are used.
+/// \param code The HTTP response code. Usually you want 200.
+/// \param message The HTTP response message. Usually you want "OK".
+void HTTP::Parser::SendResponse(std::string code, std::string message, Socket::Connection & conn){
+  /// \todo Include GET/POST variable parsing?
+  std::map<std::string, std::string>::iterator it;
+  if (protocol.size() < 5 || protocol.substr(0, 4) != "HTTP"){
+    protocol = "HTTP/1.0";
+  }
+  builder = protocol + " " + code + " " + message + "\r\n";
+  conn.SendNow(builder);
+  for (it = headers.begin(); it != headers.end(); it++){
+    if (( *it).first != "" && ( *it).second != ""){
+      if (( *it).first != "Content-Length" || ( *it).second != "0"){
+        builder = ( *it).first + ": " + ( *it).second + "\r\n";
+        conn.SendNow(builder);
+      }
+    }
+  }
+  conn.SendNow("\r\n", 2);
+  conn.SendNow(body);
+}
+
+/// Creates and sends a valid HTTP 1.0 or 1.1 response, based on the given request.
+/// The headers must be set before this call is made.
+/// This call sets up chunked transfer encoding if the request was protocol HTTP/1.1, otherwise uses a zero-content-length HTTP/1.0 response.
+/// \param code The HTTP response code. Usually you want 200.
+/// \param message The HTTP response message. Usually you want "OK".
+/// \param request The HTTP request to respond to.
+/// \param conn The connection to send over.
+void HTTP::Parser::StartResponse(std::string code, std::string message, HTTP::Parser & request, Socket::Connection & conn){
+  protocol = request.protocol;
+  body = "";
+  if (protocol == "HTTP/1.1"){
+    SetHeader("Transfer-Encoding", "chunked");
+  }else{
+    SetBody("");
+  }
+  SendResponse(code, message, conn);
+}
+
+/// Creates and sends a valid HTTP 1.0 or 1.1 response, based on the given request.
+/// The headers must be set before this call is made.
+/// This call sets up chunked transfer encoding if the request was protocol HTTP/1.1, otherwise uses a zero-content-length HTTP/1.0 response.
+/// This call simply calls StartResponse("200", "OK", request, conn)
+/// \param request The HTTP request to respond to.
+/// \param conn The connection to send over.
+void HTTP::Parser::StartResponse(HTTP::Parser & request, Socket::Connection & conn){
+  StartResponse("200", "OK", request, conn);
+}
+
+/// After receiving a header with this object, this function call will:
+/// - Forward the headers to the 'to' Socket::Connection.
+/// - Retrieve all the body from the 'from' Socket::Connection.
+/// - Forward those contents as-is to the 'to' Socket::Connection.
+/// It blocks until completed or either of the connections reaches an error state.
+void HTTP::Parser::Proxy(Socket::Connection & from, Socket::Connection & to){
+  SendResponse("200", "OK", to);
+  if (getChunks){
+    unsigned int proxyingChunk = 0;
+    while (to.connected() && from.connected()){
+      if ((from.Received().size() && (from.Received().size() > 1 || *(from.Received().get().rbegin()) == '\n')) || from.spool()){
+        if (proxyingChunk){
+          while (proxyingChunk && from.Received().size()){
+            unsigned int toappend = from.Received().get().size();
+            if (toappend > proxyingChunk){
+              toappend = proxyingChunk;
+              to.SendNow(from.Received().get().c_str(), toappend);
+              from.Received().get().erase(0, toappend);
+            }else{
+              to.SendNow(from.Received().get());
+              from.Received().get().clear();
+            }
+            proxyingChunk -= toappend;
+          }
+        }else{
+          //Make sure the received data ends in a newline (\n).
+          if ( *(from.Received().get().rbegin()) != '\n'){
+            if (from.Received().size() > 1){
+              //make a copy of the first part
+              std::string tmp = from.Received().get();
+              //clear the first part, wiping it from the partlist
+              from.Received().get().clear();
+              from.Received().size();
+              //take the now first (was second) part, insert the stored part in front of it
+              from.Received().get().insert(0, tmp);
+            }else{
+              Util::sleep(100);
+            }
+            if ( *(from.Received().get().rbegin()) != '\n'){
+              continue;
+            }
+          }
+          //forward the size and any empty lines
+          to.SendNow(from.Received().get());
+          
+          std::string tmpA = from.Received().get().substr(0, from.Received().get().size() - 1);
+          while (tmpA.find('\r') != std::string::npos){
+            tmpA.erase(tmpA.find('\r'));
+          }
+          unsigned int chunkLen = 0;
+          if ( !tmpA.empty()){
+            for (int i = 0; i < tmpA.size(); ++i){
+              chunkLen = (chunkLen << 4) | unhex(tmpA[i]);
+            }
+            if (chunkLen == 0){
+              getChunks = false;
+              to.SendNow("\r\n", 2);
+              return;
+            }
+            proxyingChunk = chunkLen;
+          }
+          from.Received().get().clear();
+        }
+      }else{
+        Util::sleep(100);
+      }
+    }
+  }else{
+    unsigned int bodyLen = length;
+    while (bodyLen > 0 && to.connected() && from.connected()){
+      if (from.Received().size() || from.spool()){
+        if (from.Received().get().size() <= bodyLen){
+          to.SendNow(from.Received().get());
+          bodyLen -= from.Received().get().size();
+          from.Received().get().clear();
+        }else{
+          to.SendNow(from.Received().get().c_str(), bodyLen);
+          from.Received().get().erase(0, bodyLen);
+          bodyLen = 0;
+        }
+      }else{
+        Util::sleep(100);
+      }
+    }
+  }
 }
 
 /// Trims any whitespace at the front or back of the string.
@@ -141,15 +304,38 @@ void HTTP::Parser::SetVar(std::string i, std::string v){
   }
 }
 
+/// Attempt to read a whole HTTP request or response from a Socket::Connection.
+/// If a whole request could be read, it is removed from the front of the socket buffer and true returned.
+/// If not, as much as can be interpreted is removed and false returned.
+/// \param conn The socket to read from.
+/// \return True if a whole request or response was read, false otherwise.
+bool HTTP::Parser::Read(Socket::Connection & conn){
+  //Make sure the received data ends in a newline (\n).
+  while ( *(conn.Received().get().rbegin()) != '\n'){
+    if (conn.Received().size() > 1){
+      //make a copy of the first part
+      std::string tmp = conn.Received().get();
+      //clear the first part, wiping it from the partlist
+      conn.Received().get().clear();
+      conn.Received().size();
+      //take the now first (was second) part, insert the stored part in front of it
+      conn.Received().get().insert(0, tmp);
+    }else{
+      return false;
+    }
+  }
+  return parse(conn.Received().get());
+} //HTTPReader::Read
+
 /// Attempt to read a whole HTTP request or response from a std::string buffer.
-/// If a whole request could be read, it is removed from the front of the given buffer.
+/// If a whole request could be read, it is removed from the front of the given buffer and true returned.
+/// If not, as much as can be interpreted is removed and false returned.
 /// \param strbuf The buffer to read from.
 /// \return True if a whole request or response was read, false otherwise.
 bool HTTP::Parser::Read(std::string & strbuf){
   return parse(strbuf);
 } //HTTPReader::Read
 
-#include <iostream>
 /// Attempt to read a whole HTTP response or request from a data buffer.
 /// If succesful, fills its own fields with the proper data and removes the response/request
 /// from the data buffer.
@@ -176,18 +362,34 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer){
         seenReq = true;
         f = tmpA.find(' ');
         if (f != std::string::npos){
-          method = tmpA.substr(0, f);
-          tmpA.erase(0, f + 1);
-          f = tmpA.find(' ');
-          if (f != std::string::npos){
-            url = tmpA.substr(0, f);
+          if (tmpA.substr(0, 4) == "HTTP"){
+            protocol = tmpA.substr(0, f);
             tmpA.erase(0, f + 1);
-            protocol = tmpA;
-            if (url.find('?') != std::string::npos){
-              parseVars(url.substr(url.find('?') + 1)); //parse GET variables
+            f = tmpA.find(' ');
+            if (f != std::string::npos){
+              url = tmpA.substr(0, f);
+              tmpA.erase(0, f + 1);
+              method = tmpA;
+              if (url.find('?') != std::string::npos){
+                parseVars(url.substr(url.find('?') + 1)); //parse GET variables
+              }
+            }else{
+              seenReq = false;
             }
           }else{
-            seenReq = false;
+            method = tmpA.substr(0, f);
+            tmpA.erase(0, f + 1);
+            f = tmpA.find(' ');
+            if (f != std::string::npos){
+              url = tmpA.substr(0, f);
+              tmpA.erase(0, f + 1);
+              protocol = tmpA;
+              if (url.find('?') != std::string::npos){
+                parseVars(url.substr(url.find('?') + 1)); //parse GET variables
+              }
+            }else{
+              seenReq = false;
+            }
           }
         }else{
           seenReq = false;
@@ -217,6 +419,9 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer){
     }
     if (seenHeaders){
       if (length > 0){
+        if (headerOnly){
+          return true;
+        }
         unsigned int toappend = length - body.length();
         if (toappend > 0){
           body.append(HTTPbuffer, 0, toappend);
@@ -230,6 +435,9 @@ bool HTTP::Parser::parse(std::string & HTTPbuffer){
         }
       }else{
         if (getChunks){
+          if (headerOnly){
+            return true;
+          }
           if (doingChunk){
             unsigned int toappend = HTTPbuffer.size();
             if (toappend > doingChunk){
@@ -304,16 +512,38 @@ void HTTP::Parser::parseVars(std::string data){
   }
 }
 
-/// Converts a string to chunked format if protocol is HTTP/1.1 - does nothing otherwise.
-/// \param bodypart The data to convert - will be converted in-place.
-void HTTP::Parser::Chunkify(std::string & bodypart){
+/// Sends a string in chunked format if protocol is HTTP/1.1, sends as-is otherwise.
+/// \param bodypart The data to send.
+/// \param conn The connection to use for sending.
+void HTTP::Parser::Chunkify(std::string & bodypart, Socket::Connection & conn){
+  Chunkify(bodypart.c_str(), bodypart.size(), conn);
+}
+
+/// Sends a string in chunked format if protocol is HTTP/1.1, sends as-is otherwise.
+/// \param data The data to send.
+/// \param size The size of the data to send.
+/// \param conn The connection to use for sending.
+void HTTP::Parser::Chunkify(const char * data, unsigned int size, Socket::Connection & conn){
   if (protocol == "HTTP/1.1"){
-    static char len[10];
-    int sizelen = snprintf(len, 10, "%x\r\n", (unsigned int)bodypart.size());
+    char len[10];
+    int sizelen = snprintf(len, 10, "%x\r\n", size);
     //prepend the chunk size and \r\n
-    bodypart.insert(0, len, sizelen);
+    conn.SendNow(len, sizelen);
+    //send the chunk itself
+    conn.SendNow(data, size);
     //append \r\n
-    bodypart.append("\r\n", 2);
+    conn.SendNow("\r\n", 2);
+    if ( !size){
+      //append \r\n again if this was the end of the file (required by chunked transfer encoding according to spec)
+      conn.SendNow("\r\n", 2);
+    }
+  }else{
+    //just send the chunk itself
+    conn.SendNow(data, size);
+    //close the connection if this was the end of the file
+    if ( !size){
+      conn.close();
+    }
   }
 }
 

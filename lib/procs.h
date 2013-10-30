@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <string>
 #include <map>
+#include <vector>
 
 /// Contains utility code, not directly related to streaming media
 namespace Util {
@@ -22,10 +23,14 @@ namespace Util {
       static void runCmd(std::string & cmd);
       static void setHandler();
   public:
+      static std::string getOutputOf(char* const* argv);
+      static std::string getOutputOf(std::string cmd);
       static pid_t Start(std::string name, std::string cmd);
       static pid_t Start(std::string name, std::string cmd, std::string cmd2);
       static pid_t Start(std::string name, std::string cmd, std::string cmd2, std::string cmd3);
-      static pid_t StartPiped(std::string name, char * argv[], int * fdin, int * fdout, int * fderr);
+      static pid_t StartPiped(std::string name, char* const* argv, int * fdin, int * fdout, int * fderr);
+      static pid_t StartPiped(std::string name, std::string cmd, int * fdin, int * fdout, int * fderr);
+      static pid_t StartPiped2(std::string name, std::string cmd1, std::string cmd2, int * fdin, int * fdout, int * fderr1, int * fderr2);
       static void Stop(std::string name);
       static void Stop(pid_t name);
       static void StopAll();

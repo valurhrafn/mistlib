@@ -25,47 +25,66 @@ std::map<pid_t, Util::TerminationNotifier> Util::Procs::exitHandlers;
 bool Util::Procs::handler_set = false;
 
 /// Called at exit of any program that used a Start* function.
-/// Waits up to 2.5 seconds, then sends SIGINT signal to all managed processes.
-/// After that waits up to 10 seconds for children to exit, then sends SIGKILL to
+/// Waits up to 1 second, then sends SIGINT signal to all managed processes.
+/// After that waits up to 5 seconds for children to exit, then sends SIGKILL to
 /// all remaining children. Waits one more second for cleanup to finish, then exits.
 void Util::Procs::exit_handler(){
   int waiting = 0;
-  while ( !plist.empty()){
-    Util::sleep(100);
-    if (++waiting > 25){
-      break;
+  std::map<pid_t, std::string> listcopy = plist;
+  std::map<pid_t, std::string>::iterator it;
+
+  //wait up to 1 second for applications to shut down 
+  while ( !listcopy.empty() && waiting <= 50){
+    for (it = listcopy.begin(); it != listcopy.end(); it++){
+      if (kill(( *it).first, 0) == 0){
+        Util::sleep(20);
+        ++waiting;
+      }else{
+        listcopy.erase(it);
+        break;
+      }
     }
   }
   
-  if ( !plist.empty()){
-    std::map<pid_t, std::string> listcopy = plist;
-    std::map<pid_t, std::string>::iterator it;
+  //send sigint to all remaining
+  if ( !listcopy.empty()){
     for (it = listcopy.begin(); it != listcopy.end(); it++){
       kill(( *it).first, SIGINT);
     }
   }
 
   waiting = 0;
-  while ( !plist.empty()){
-    Util::sleep(200);
-    if (++waiting > 25){
-      break;
+  //wait up to 5 seconds for applications to shut down 
+  while ( !listcopy.empty() && waiting <= 50){
+    for (it = listcopy.begin(); it != listcopy.end(); it++){
+      if (kill(( *it).first, 0) == 0){
+        Util::sleep(100);
+        ++waiting;
+      }else{
+        listcopy.erase(it);
+        break;
+      }
     }
   }
-
+  
+  //send sigkill to all remaining
   if ( !plist.empty()){
-    std::map<pid_t, std::string> listcopy = plist;
-    std::map<pid_t, std::string>::iterator it;
     for (it = listcopy.begin(); it != listcopy.end(); it++){
       kill(( *it).first, SIGKILL);
     }
   }
 
   waiting = 0;
-  while ( !plist.empty()){
-    Util::sleep(100);
-    if (++waiting > 10){
-      break;
+  //wait up to 1 second for applications to shut down 
+  while ( !listcopy.empty() && waiting <= 50){
+    for (it = listcopy.begin(); it != listcopy.end(); it++){
+      if (kill(( *it).first, 0) == 0){
+        Util::sleep(20);
+        ++waiting;
+      }else{
+        listcopy.erase(it);
+        break;
+      }
     }
   }
   
@@ -91,46 +110,77 @@ void Util::Procs::childsig_handler(int signum){
     return;
   }
   int status;
-  pid_t ret = waitpid( -1, &status, WNOHANG);
-  if (ret == 0){ //ignore, would block otherwise
-    return;
-  }else if (ret < 0){
-#if DEBUG >= 3
-    std::cerr << "SIGCHLD received, but no child died";
-#endif
-    return;
-  }
-  int exitcode;
-  if (WIFEXITED(status)){
-    exitcode = WEXITSTATUS(status);
-  }else if (WIFSIGNALED(status)){
-    exitcode = -WTERMSIG(status);
-  }else{/* not possible */
-    return;
-  }
+  pid_t ret = -1;
+  while (ret != 0){
+    ret = waitpid( -1, &status, WNOHANG);
+    if (ret <= 0){ //ignore, would block otherwise
+      if (ret == 0 || errno != EINTR){
+        return;
+      }
+    }
+    int exitcode;
+    if (WIFEXITED(status)){
+      exitcode = WEXITSTATUS(status);
+    }else if (WIFSIGNALED(status)){
+      exitcode = -WTERMSIG(status);
+    }else{/* not possible */
+      return;
+    }
 
-#if DEBUG >= 1
-  std::string pname = plist[ret];
+#if DEBUG >= 5
+    std::string pname = plist[ret];
 #endif
-  plist.erase(ret);
-#if DEBUG >= 1
-  if (isActive(pname)){
-    Stop(pname);
-  } else{
-    //can this ever happen?
-    std::cerr << "Process " << pname << " fully terminated." << std::endl;
-  }
+    plist.erase(ret);
+#if DEBUG >= 5
+    if (!isActive(pname)){
+      std::cerr << "Process " << pname << " fully terminated." << std::endl;
+    }
 #endif
 
-  if (exitHandlers.count(ret) > 0){
-    TerminationNotifier tn = exitHandlers[ret];
-    exitHandlers.erase(ret);
-#if DEBUG >= 2
-    std::cerr << "Calling termination handler for " << pname << std::endl;
+    if (exitHandlers.count(ret) > 0){
+      TerminationNotifier tn = exitHandlers[ret];
+      exitHandlers.erase(ret);
+#if DEBUG >= 5
+      std::cerr << "Calling termination handler for " << pname << std::endl;
 #endif
-    tn(ret, exitcode);
+      tn(ret, exitcode);
+    }
   }
 }
+
+
+/// Runs the given command and returns the stdout output as a string.
+std::string Util::Procs::getOutputOf(char* const* argv){
+  std::string ret;
+  int fin = 0, fout = -1, ferr = 0;
+  StartPiped("output_getter", argv, &fin, &fout, &ferr);
+  while (isActive("output_getter")){Util::sleep(100);}
+  FILE * outFile = fdopen(fout, "r");
+  char * fileBuf = 0;
+  size_t fileBufLen = 0;
+  while ( !(feof(outFile) || ferror(outFile)) && (getline(&fileBuf, &fileBufLen, outFile) != -1)){
+    ret += fileBuf;
+  }
+  fclose(outFile);
+  return ret;
+}
+
+/// Runs the given command and returns the stdout output as a string.
+std::string Util::Procs::getOutputOf(std::string cmd){
+  std::string ret;
+  int fin = 0, fout = -1, ferr = 0;
+  StartPiped("output_getter", cmd, &fin, &fout, &ferr);
+  while (isActive("output_getter")){Util::sleep(100);}
+  FILE * outFile = fdopen(fout, "r");
+  char * fileBuf = 0;
+  size_t fileBufLen = 0;
+  while ( !(feof(outFile) || ferror(outFile)) && (getline(&fileBuf, &fileBufLen, outFile) != -1)){
+    ret += fileBuf;
+  }
+  fclose(outFile);
+  return ret;
+}
+
 
 /// Attempts to run the command cmd.
 /// Replaces the current process - use after forking first!
@@ -175,7 +225,7 @@ pid_t Util::Procs::Start(std::string name, std::string cmd){
     runCmd(cmd);
   }else{
     if (ret > 0){
-#if DEBUG >= 1
+#if DEBUG >= 5
       std::cerr << "Process " << name << " started, PID " << ret << ": " << cmd << std::endl;
 #endif
       plist.insert(std::pair<pid_t, std::string>(ret, name));
@@ -239,7 +289,7 @@ pid_t Util::Procs::Start(std::string name, std::string cmd, std::string cmd2){
     runCmd(cmd2);
   }else{
     if (ret2 > 0){
-#if DEBUG >= 1
+#if DEBUG >= 5
       std::cerr << "Process " << name << " started, PIDs (" << ret << ", " << ret2 << "): " << cmd << " | " << cmd2 << std::endl;
 #endif
       plist.insert(std::pair<pid_t, std::string>(ret2, name));
@@ -322,7 +372,7 @@ pid_t Util::Procs::Start(std::string name, std::string cmd, std::string cmd2, st
     runCmd(cmd2);
   }else{
     if (ret2 > 0){
-#if DEBUG >= 1
+#if DEBUG >= 5
       std::cerr << "Process " << name << " started, PIDs (" << ret << ", " << ret2 << "): " << cmd << " | " << cmd2 << std::endl;
 #endif
       plist.insert(std::pair<pid_t, std::string>(ret2, name));
@@ -353,7 +403,7 @@ pid_t Util::Procs::Start(std::string name, std::string cmd, std::string cmd2, st
     runCmd(cmd3);
   }else{
     if (ret3 > 0){
-#if DEBUG >= 1
+#if DEBUG >= 5
       std::cerr << "Process " << name << " started, PIDs (" << ret << ", " << ret2 << ", " << ret3 << "): " << cmd << " | " << cmd2 << " | " << cmd3 << std::endl;
 #endif
       plist.insert(std::pair<pid_t, std::string>(ret3, name));
@@ -380,8 +430,11 @@ pid_t Util::Procs::Start(std::string name, std::string cmd, std::string cmd2, st
 /// \arg fdin Standard input file descriptor. If null, /dev/null is assumed. Otherwise, if arg contains -1, a new fd is automatically allocated and written into this arg. Then the arg will be used as fd.
 /// \arg fdout Same as fdin, but for stdout.
 /// \arg fdout Same as fdin, but for stderr.
-pid_t Util::Procs::StartPiped(std::string name, char * argv[], int * fdin, int * fdout, int * fderr){
+pid_t Util::Procs::StartPiped(std::string name, char* const* argv, int * fdin, int * fdout, int * fderr){
   if (isActive(name)){
+    #if DEBUG >= 1
+    std::cerr << name << " already active - skipping start" << std::endl;
+    #endif
     return getPid(name);
   }
   pid_t pid;
@@ -500,7 +553,7 @@ pid_t Util::Procs::StartPiped(std::string name, char * argv[], int * fdin, int *
     }
     return 0;
   }else{ //parent
-#if DEBUG >= 1
+#if DEBUG >= 5
   std::cerr << "Piped process " << name << " started";
   if (fdin ) std::cerr << " in=" << (*fdin == -1 ? pipein [1] : *fdin );
   if (fdout) std::cerr << " out=" << (*fdout == -1 ? pipeout[0] : *fdout);
@@ -528,6 +581,59 @@ pid_t Util::Procs::StartPiped(std::string name, char * argv[], int * fdin, int *
   return pid;
 }
 
+/// Starts a new process with given fds if the name is not already active.
+/// \return 0 if process was not started, process PID otherwise.
+/// \arg name Name for this process - only used internally.
+/// \arg cmd Command for this process.
+/// \arg fdin Standard input file descriptor. If null, /dev/null is assumed. Otherwise, if arg contains -1, a new fd is automatically allocated and written into this arg. Then the arg will be used as fd.
+/// \arg fdout Same as fdin, but for stdout.
+/// \arg fdout Same as fdin, but for stderr.
+pid_t Util::Procs::StartPiped(std::string name, std::string cmd, int * fdin, int * fdout, int * fderr){
+  //Convert the given command to a char * []
+  char * tmp = (char*)cmd.c_str();
+  char * tmp2 = 0;
+  char * args[21];
+  int i = 0;
+  tmp2 = strtok(tmp, " ");
+  args[0] = tmp2;
+  while (tmp2 != 0 && (i < 20)){
+    tmp2 = strtok(0, " ");
+    ++i;
+    args[i] = tmp2;
+  }
+  if (i == 20){
+    args[20] = 0;
+  }
+  return StartPiped(name,args,fdin,fdout,fderr);
+}
+
+
+pid_t Util::Procs::StartPiped2(std::string name, std::string cmd1, std::string cmd2, int * fdin, int * fdout, int * fderr1, int * fderr2){
+  int pfildes[2];
+  if (pipe(pfildes) == -1){
+#if DEBUG >= 1
+    std::cerr << "Process " << name << " could not be started. Pipe creation failed." << std::endl;
+#endif
+    return 0;
+  }
+  pid_t res1 = StartPiped(name, cmd1, fdin, &pfildes[1], fderr1);
+  if ( !res1){
+    close(pfildes[1]);
+    close(pfildes[0]);
+    return 0;
+  }
+  pid_t res2 = StartPiped(name+"receiving", cmd2, &pfildes[0], fdout, fderr2);
+  if ( !res2){
+    Stop(res1);
+    close(pfildes[1]);
+    close(pfildes[0]);
+    return 0;
+  }
+  //we can close these because the fork in StartPiped() copies them.
+  close(pfildes[1]);
+  close(pfildes[0]);
+  return res1;
+}
 /// Stops the named process, if running.
 /// \arg name (Internal) name of process to stop
 void Util::Procs::Stop(std::string name){
@@ -565,10 +671,15 @@ int Util::Procs::Count(){
 
 /// Returns true if a process by this name is currently active.
 bool Util::Procs::isActive(std::string name){
+  std::map<pid_t, std::string> listcopy = plist;
   std::map<pid_t, std::string>::iterator it;
-  for (it = plist.begin(); it != plist.end(); it++){
+  for (it = listcopy.begin(); it != listcopy.end(); it++){
     if (( *it).second == name){
-      return true;
+      if (kill(( *it).first, 0) == 0){
+        return true;
+      }else{
+        plist.erase(( *it).first);
+      }
     }
   }
   return false;
@@ -576,7 +687,7 @@ bool Util::Procs::isActive(std::string name){
 
 /// Returns true if a process with this PID is currently active.
 bool Util::Procs::isActive(pid_t name){
-  return (plist.count(name) == 1);
+  return (plist.count(name) == 1) && (kill(name, 0) == 0);
 }
 
 /// Gets PID for this named process, if active.

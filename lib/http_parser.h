@@ -6,6 +6,7 @@
 #include <string>
 #include <stdlib.h>
 #include <stdio.h>
+#include "socket.h"
 
 /// Holds all HTTP processing related code.
 namespace HTTP {
@@ -13,6 +14,7 @@ namespace HTTP {
   class Parser{
     public:
       Parser();
+      bool Read(Socket::Connection & conn);
       bool Read(std::string & strbuf);
       std::string GetHeader(std::string i);
       std::string GetVar(std::string i);
@@ -24,7 +26,13 @@ namespace HTTP {
       void SetBody(char * buffer, int len);
       std::string & BuildRequest();
       std::string & BuildResponse(std::string code, std::string message);
-      void Chunkify(std::string & bodypart);
+      void SendRequest(Socket::Connection & conn);
+      void SendResponse(std::string code, std::string message, Socket::Connection & conn);
+      void StartResponse(std::string code, std::string message, Parser & request, Socket::Connection & conn);
+      void StartResponse(Parser & request, Socket::Connection & conn);
+      void Chunkify(std::string & bodypart, Socket::Connection & conn);
+      void Chunkify(const char * data, unsigned int size, Socket::Connection & conn);
+      void Proxy(Socket::Connection & from, Socket::Connection & to);
       void Clean();
       static std::string urlunescape(const std::string & in);
       static std::string urlencode(const std::string & in);
@@ -33,6 +41,7 @@ namespace HTTP {
       std::string url;
       std::string protocol;
       unsigned int length;
+      bool headerOnly; ///< If true, do not parse body if the length is a known size.
     private:
       bool seenHeaders;
       bool seenReq;

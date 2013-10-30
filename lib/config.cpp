@@ -10,6 +10,9 @@
 #else
 #include <wait.h>
 #endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include <errno.h>
 #include <iostream>
 #include <signal.h>
@@ -21,6 +24,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <fstream>
+#include <dirent.h> //for getMyExec
 
 bool Util::Config::is_active = false;
 std::string Util::Config::libver = PACKAGE_VERSION;
@@ -28,7 +32,7 @@ std::string Util::Config::libver = PACKAGE_VERSION;
 /// Creates a new configuration manager.
 Util::Config::Config(std::string cmd, std::string version){
   vals.null();
-  long_count = 0;
+  long_count = 2;
   vals["cmd"]["value"].append(cmd);
   vals["version"]["long"] = "version";
   vals["version"]["short"] = "v";
@@ -167,44 +171,46 @@ void Util::Config::printHelp(std::ostream & output){
 
 /// Parses commandline arguments.
 /// Calls exit if an unknown option is encountered, printing a help message.
-void Util::Config::parseArgs(int argc, char ** argv){
+bool Util::Config::parseArgs(int & argc, char ** & argv){
   int opt = 0;
   std::string shortopts;
   struct option * longOpts = (struct option*)calloc(long_count + 1, sizeof(struct option));
   int long_i = 0;
   int arg_count = 0;
-  for (JSON::ObjIter it = vals.ObjBegin(); it != vals.ObjEnd(); it++){
-    if (it->second.isMember("short")){
-      shortopts += it->second["short"].asString();
-      if (it->second.isMember("arg")){
-        shortopts += ":";
+  if (vals.size()){
+    for (JSON::ObjIter it = vals.ObjBegin(); it != vals.ObjEnd(); it++){
+      if (it->second.isMember("short")){
+        shortopts += it->second["short"].asString();
+        if (it->second.isMember("arg")){
+          shortopts += ":";
+        }
       }
-    }
-    if (it->second.isMember("short_off")){
-      shortopts += it->second["short_off"].asString();
-      if (it->second.isMember("arg")){
-        shortopts += ":";
+      if (it->second.isMember("short_off")){
+        shortopts += it->second["short_off"].asString();
+        if (it->second.isMember("arg")){
+          shortopts += ":";
+        }
       }
-    }
-    if (it->second.isMember("long")){
-      longOpts[long_i].name = it->second["long"].asString().c_str();
-      longOpts[long_i].val = it->second["short"].asString()[0];
-      if (it->second.isMember("arg")){
-        longOpts[long_i].has_arg = 1;
+      if (it->second.isMember("long")){
+        longOpts[long_i].name = it->second["long"].asString().c_str();
+        longOpts[long_i].val = it->second["short"].asString()[0];
+        if (it->second.isMember("arg")){
+          longOpts[long_i].has_arg = 1;
+        }
+        long_i++;
       }
-      long_i++;
-    }
-    if (it->second.isMember("long_off")){
-      longOpts[long_i].name = it->second["long_off"].asString().c_str();
-      longOpts[long_i].val = it->second["short_off"].asString()[0];
-      if (it->second.isMember("arg")){
-        longOpts[long_i].has_arg = 1;
+      if (it->second.isMember("long_off")){
+        longOpts[long_i].name = it->second["long_off"].asString().c_str();
+        longOpts[long_i].val = it->second["short_off"].asString()[0];
+        if (it->second.isMember("arg")){
+          longOpts[long_i].has_arg = 1;
+        }
+        long_i++;
       }
-      long_i++;
-    }
-    if (it->second.isMember("arg_num") && !(it->second.isMember("value") && it->second["value"].size())){
-      if (it->second["arg_num"].asInt() > arg_count){
-        arg_count = it->second["arg_num"].asInt();
+      if (it->second.isMember("arg_num") && !(it->second.isMember("value") && it->second["value"].size())){
+        if (it->second["arg_num"].asInt() > arg_count){
+          arg_count = it->second["arg_num"].asInt();
+        }
       }
     }
   }
@@ -241,17 +247,16 @@ void Util::Config::parseArgs(int argc, char ** argv){
     for (JSON::ObjIter it = vals.ObjBegin(); it != vals.ObjEnd(); it++){
       if (it->second.isMember("arg_num") && it->second["arg_num"].asInt() == long_i){
         it->second["value"].append((std::string)argv[optind]);
-        optind++;
-        long_i++;
         break;
       }
     }
+    optind++;
+    long_i++;
   }
   if (long_i <= arg_count){
-    std::cerr << "Usage error: missing argument(s)." << std::endl;
-    printHelp(std::cout);
-    exit(1);
+    return false;
   }
+  return true;
 }
 
 /// Returns a reference to the current value of an option or default if none was set.
@@ -332,31 +337,85 @@ void Util::Config::signal_handler(int signum){
   }
 } //signal_handler
 
-/// Adds the default connector options to this Util::Config object.
-void Util::Config::addConnectorOptions(int port){
-  JSON::Value stored_port = JSON::fromString("{\"long\":\"port\", \"short\":\"p\", \"arg\":\"integer\", \"help\":\"TCP port to listen on.\"}");
-  stored_port["value"].append((long long int)port);
-  addOption("listen_port", stored_port);
-  addOption("listen_interface",
-      JSON::fromString(
-          "{\"long\":\"interface\", \"value\":[\"0.0.0.0\"], \"short\":\"i\", \"arg\":\"string\", \"help\":\"Interface address to listen on, or 0.0.0.0 for all available interfaces.\"}"));
-  addOption("username",
-      JSON::fromString(
-          "{\"long\":\"username\", \"value\":[\"root\"], \"short\":\"u\", \"arg\":\"string\", \"help\":\"Username to drop privileges to, or root to not drop provileges.\"}"));
-  addOption("daemonize",
-      JSON::fromString(
-          "{\"long\":\"daemon\", \"short\":\"d\", \"value\":[1], \"long_off\":\"nodaemon\", \"short_off\":\"n\", \"help\":\"Whether or not to daemonize the process after starting.\"}"));
+/// Adds the default connector options. Also updates the capabilities structure with the default options.
+/// Besides the options addBasicConnectorOptions adds, this function also adds port and interface options.
+void Util::Config::addConnectorOptions(int port, JSON::Value & capabilities){
+  JSON::Value option;
+  option.null();
+  option["long"] = "port";
+  option["short"] = "p";
+  option["arg"] = "integer";
+  option["help"] = "TCP port to listen on";
+  option["value"].append((long long)port);
+  addOption("listen_port", option);
+  capabilities["optional"]["port"]["name"] = "TCP port";
+  capabilities["optional"]["port"]["help"] = "TCP port to listen on - default if unprovided is "+option["value"][0u].asString();
+  capabilities["optional"]["port"]["type"] = "uint";
+  capabilities["optional"]["port"]["option"] = "--port";
+  capabilities["optional"]["port"]["default"] = option["value"][0u];
+  
+  option.null();
+  option["long"] = "interface";
+  option["short"] = "i";
+  option["arg"] = "string";
+  option["help"] = "Interface address to listen on, or 0.0.0.0 for all available interfaces.";
+  option["value"].append("0.0.0.0");
+  addOption("listen_interface", option);
+  capabilities["optional"]["interface"]["name"] = "Interface";
+  capabilities["optional"]["interface"]["help"] = "Address of the interface to listen on - default if unprovided is all interfaces";
+  capabilities["optional"]["interface"]["option"] = "--interface";
+  capabilities["optional"]["interface"]["type"] = "str";
+  
+  addBasicConnectorOptions(capabilities);
 } //addConnectorOptions
+
+/// Adds the default connector options. Also updates the capabilities structure with the default options.
+void Util::Config::addBasicConnectorOptions(JSON::Value & capabilities){
+  JSON::Value option;
+  option.null();
+  option["long"] = "username";
+  option["short"] = "u";
+  option["arg"] = "string";
+  option["help"] = "Username to drop privileges to, or root to not drop provileges.";
+  option["value"].append("root");
+  addOption("username", option);
+  capabilities["optional"]["username"]["name"] = "Username";
+  capabilities["optional"]["username"]["help"] = "Username to drop privileges to - default if unprovided means do not drop privileges";
+  capabilities["optional"]["username"]["option"] = "--username";
+  capabilities["optional"]["username"]["type"] = "str";
+  
+  option.null();
+  option["long"] = "daemon";
+  option["short"] = "d";
+  option["long_off"] = "nodaemon";
+  option["short_off"] = "n";
+  option["help"] = "Whether or not to daemonize the process after starting.";
+  option["value"].append(1ll);
+  addOption("daemonize", option);
+  
+  option.null();
+  option["long"] = "json";
+  option["short"] = "j";
+  option["help"] = "Output connector info in JSON format, then exit.";
+  option["value"].append(0ll);
+  addOption("json", option);
+}
 
 /// Gets directory the current executable is stored in.
 std::string Util::getMyPath(){
   char mypath[500];
+#ifdef __APPLE__
+  memset( mypath, 0, 500);
+  unsigned int refSize = 500;
+  int ret = _NSGetExecutablePath(mypath,&refSize);
+#else
   int ret = readlink("/proc/self/exe", mypath, 500);
   if (ret != -1){
     mypath[ret] = 0;
   }else{
     mypath[0] = 0;
   }
+#endif
   std::string tPath = mypath;
   size_t slash = tPath.rfind('/');
   if (slash == std::string::npos){
@@ -367,6 +426,23 @@ std::string Util::getMyPath(){
   }
   tPath.resize(slash + 1);
   return tPath;
+}
+
+/// Gets all executables in getMyPath that start with "Mist".
+void Util::getMyExec(std::deque<std::string> & execs){
+  std::string path = Util::getMyPath();
+  DIR * d = opendir(path.c_str());
+  if (!d){return;}
+  struct dirent *dp;
+  do {
+    errno = 0;
+    if (dp = readdir(d)){
+      if (strncmp(dp->d_name, "Mist", 4) == 0){
+        execs.push_back(dp->d_name);
+      }
+    }
+  } while (dp != NULL);
+  closedir(d);
 }
 
 /// Sets the current process' running user
